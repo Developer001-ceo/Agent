@@ -1,0 +1,13 @@
+[Sat 09/19/2026  6:51:40.28] swapped agent_new.py into agent.py OK 
+[Sat 09/19/2026  7:16:02.75] WATCHDOG: agent revived OK 
+[Sat 09/19/2026  7:34:30.08] WATCHDOG: agent revived OK 
+[Sat 09/19/2026  7:34:30.22] old agent killed, waiting for socket release 
+[Sat 09/19/2026  7:34:33.23] start issued (minimized window), verifying... 
+[Sat 09/19/2026  7:34:38.26] RESTART OK - agent is listening on 8787 
+[Sat 09/19/2026  7:46:10.80] WATCHDOG: agent revived OK  
+[Sat 09/19/2026  7:46:10.95] old agent killed, waiting for socket release  
+[Sat 09/19/2026  7:46:13.96] start issued (minimized window), verifying...  
+[Sat 09/19/2026  7:46:18.99] RESTART OK - agent is listening on 8787  
+[Sat 09/19/2026  7:56:00.00] WATCHDOG: agent revived OK  
+[Sat 09/19/2026  7:56:01.55] WATCHDOG: port 8787 dead - starting agent  
+[Sat 09/19/2026  7:56:06.60] WATCHDOG: agent revived OK  

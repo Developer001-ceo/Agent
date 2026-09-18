@@ -1,5 +1,5 @@
 """
-agent.py -- Remote Test Agent for Windows  (v1.2.0)
+agent.py -- Remote Test Agent for Windows  (v1.2.2)
 ====================================================
 v1.2 additions:
   POST /uiset        -> set text on a UIA control by name (desktop forms)
@@ -14,7 +14,8 @@ v1.2 additions:
   POST /logcat       -> logcat tail or clear
   POST /adbapp       -> install/uninstall/launch/stop/clear/packages/devices
   POST /web/*        -> drive real Chrome via CDP with Playwright
-  install_watchdog.ps1 + watchdog_task.ps1 ship alongside (optional auto-restart)
+  run.bat is the SINGLE runner in this folder: start/restart/stop/status,
+  tunnel, chrome (CDP), watchdog (scheduled task) -- see README.md
 
 v1.1: /ui /uiclick /uidump /macro /upload /download
       /uidump PULLS the xml (v1.1.1 fix: `adb shell cat` truncated at 20KB)
@@ -52,7 +53,7 @@ pyautogui.PAUSE = 0.05
 TOKEN = "Czj3u9HadjO-PkEMw9X9VR_S02v_ZXKMD9CcFT1WADs"
 HOST = "127.0.0.1"          # localhost only -- never change to 0.0.0.0
 PORT = 8787
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 AGENT_ROOT = os.path.dirname(os.path.abspath(__file__))
 JOBS_DIR = os.path.join(AGENT_ROOT, "jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
@@ -1208,7 +1209,7 @@ def _web_ctx():
                     pass
                 raise HTTPException(status_code=400,
                                     detail="cannot reach Chrome CDP on 127.0.0.1:9222 (%s). "
-                                           "Close Chrome fully, then run start_chrome_debug.bat"
+                                           "Close Chrome fully, then run: run.bat chrome (in the agent folder)"
                                            % str(e)[:140])
             _WEB["pw"], _WEB["ctx"] = pw, ctx
     return _WEB["ctx"]
