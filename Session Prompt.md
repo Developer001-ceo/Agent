@@ -14,28 +14,38 @@ AI sandbox ──outbound HTTPS──> Cloudflare edge <──outbound tunnel─
 - ⚠️ Quick-tunnel URLs rotate on every restart. Never assume an old URL; always use the most recent one I paste.
 
 # CURRENT STATE ON MY PC (verify, don't redo)
-- Windows PC hostname WIN-36BCA2MFOGK, screen 2560×1600, Python 3.12.0
-- `C:\agent\` contains: agent.py, start.bat, requirements.txt, run-everything.bat (agent may be v1.0 or v1.1 — check via /health)
-- cloudflared.exe available (PATH or C:\agent)
+- Windows PC hostname WIN-36BCA2MFOGK, user prasa, screen 2560×1600, Python 3.12.0
+- Agent folder: `C:\Users\prasa\Music\Agent` — agent.py, start.bat, run-everything.bat, restart_agent.ps1, requirements.txt, Session Prompt.md (all scripts use %~dp0/$PSScriptRoot — folder is relocatable)
+- cloudflared.exe available (PATH or agent folder)
 - adb at %LOCALAPPDATA%\Android\Sdk\platform-tools — usually NO device attached; ask me to plug in + enable USB debugging before any Android work
-- pip packages: psutil, pillow, pyautogui, pywinauto
+- pip packages: fastapi, uvicorn, pyautogui, pillow, pywinauto, pygetwindow
 
-# AGENT API SPEC (v1.1) — regenerate agent.py from this if missing or older
-HTTP server on 127.0.0.1:8787. All handlers wrapped in try/except (never crash; return JSON errors). Bearer check before everything (401 on failure). JSON in/out.
-- GET  /ping       → {"ok": true}
-- GET  /health     → python version, pywinauto present, adb present, screen resolution, agent version, uptime
-- POST /screenshot → full-screen PNG as base64 (downscale to ≤1600px wide to save bandwidth)
-- POST /mouse      → {"action": "move|click|dblclick|rightclick|down|up|drag", "x", "y", "x2", "y2"}
-- POST /type       → {"text": "..."} — type via clipboard paste (SetClipboardData + Ctrl+V) for unicode safety, restore clipboard after
-- POST /key        → {"key": "enter|tab|esc|ctrl+s|win|alt+f4|..."}
-- POST /exec       → {"cmd": "...", "timeout": 30} → subprocess shell, return stdout/stderr/returncode (truncate ~64KB)
-- POST /ui         → {"title": "Notepad"} → pywinauto backend="uia": dump control tree as compact JSON [{type, name, auto_id, rect, enabled}]
-- POST /uiclick    → {"title", "name"|"auto_id", "action": "click|set_text", "value"} → act on the CONTROL, not pixels
-- POST /uidump     → Android only: adb shell uiautomator dump → pull XML → parse → return nodes [text, resource-id, bounds, clickable]
-- POST /macro      → {"steps": [...], "stop_on_error": true} → run a sequence of the above endpoints in ONE HTTP round trip, return per-step results
-- POST /upload     → {"path": "C:\\agent\\x.py", "b64": "..."} → write decoded bytes
-- POST /download   → {"path": "..."} → {"b64": "...", "size": ...}
-- GET  /           → simple HTML status page (handy for tunnel testing in a browser)
+# AGENT API SPEC (v1.1.1 — EXACT, matches agent.py; wrong endpoint/fields = 422/404)
+FastAPI on 127.0.0.1:8787. Bearer check on everything except /ping (401 on bad token). JSON in/out.
+- GET  /ping       → {"ok":true,"ts":...}  (no auth — connectivity check)
+- GET  /health     → {ok, host, screen{width,height}, adb, pywinauto, agent_version}
+- GET  /screenshot?fmt=jpeg|png&q=85&region=x,y,w,h → RAW image bytes (NOT base64, NOT POST)
+- POST /click      {"x":int,"y":int,"button":"left|right|middle","clicks":1}
+- POST /move       {"x":int,"y":int,"duration":0.2}
+- POST /drag       {"x1":int,"y1":int,"x2":int,"y2":int,"duration":0.5}
+- POST /scroll     {"dx":0,"dy":int}   (dy>0 scrolls up)
+- POST /type       {"text":"...","interval":0.01} — ASCII only; for unicode: /run Set-Clipboard then /key {"keys":["ctrl","v"],"combo":true}
+- POST /key        {"keys":["enter"],"combo":false} — combo=true = pressed together (hotkey); false = sequence
+- POST /window     {"title":"Notepad","action":"activate|minimize|close"}
+- POST /run        {"command":"...","shell":"powershell|cmd","timeout":120} → {exit,stdout,stderr,ok} (stdout/stderr = LAST 20KB)
+- POST /adb        {"args":["devices"],"timeout":120} → same shape as /run
+- GET  /windows    → {"ok":true,"titles":[...top 200...]}
+- GET  /ui?title=Notepad&max_depth=10&max_nodes=500 → {ok,window,count,truncated,elements:[{type,name,auto_id,rect,center,enabled}]}
+- POST /uiclick    {"title":"Notepad","name":"OK","control_type":null,"index":0} → real-mouse-clicks element whose name CONTAINS "name"
+- POST /uidump     {"serial":null} → {ok,count,elements:[{text,desc,res,class,clickable,bounds,center}]}
+- POST /macro      {"steps":[{"action":"click","x":10,"y":20},...],"stop_on_error":true,"capture":true,"screenshot_q":80}
+    step actions: click{x,y,clicks,button} move{x,y,duration} drag{x1,y1,x2,y2,duration} scroll{dx,dy}
+                  type{text,interval} key{keys,combo} sleep{ms ≤10000} window{title,op}
+                  run{command,shell,timeout ≤25} adb{args,timeout}
+    → {ok,elapsed,results:[{i,action,ok,detail|error}],screenshot:<b64 jpeg|null>} (whole macro capped 30s)
+- POST /upload     {"path":"agent_new.py","data":"<base64>","append":false} — sandboxed to the agent folder; chunk by appending (chunk the BINARY before encoding)
+- POST /download   {"path":"results.json"} → {ok,path,bytes,data:"<base64>"} (≤80MB)
+- NOTE: there is NO GET / status page and NO /exec endpoint — /run is the executor.
 
 # BOOTSTRAP PROCEDURE (fresh session)
 1. Take TUNNEL_URL from this prompt (or my first message) — do not ask me for it, it's already running.
@@ -44,7 +54,7 @@ HTTP server on 127.0.0.1:8787. All handlers wrapped in try/except (never crash; 
    a. curl /ping (expect {"ok":true}; DNS failure ⇒ ask me to restart the tunnel)
    b. /health
    c. /screenshot (confirm it's really my desktop)
-4. If agent.py needs changes: /upload to C:\agent\agent_new.py → /exec `python -m py_compile C:\agent\agent_new.py` → /exec swap+restart → re-verify /ping + /health. Never edit the live file in place.
+4. If agent.py needs changes: /upload to agent_new.py (relative path = agent folder) → /run `python -m py_compile <agent_dir>\agent_new.py` → /run powershell restart_agent.ps1 (the HTTP response WILL be lost — the restart kills the agent mid-request; just poll /ping) → re-verify /ping + /health. Never edit the live file in place.
 
 # WORKING CONVENTIONS
 - Prefer /macro batches over one-request-per-action (tunnel round-trip latency adds up).

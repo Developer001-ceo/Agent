@@ -11,6 +11,8 @@ v1.1 additions:
 
 All v1.0 endpoints unchanged: /ping /health /screenshot /windows
   /click /drag /move /scroll /type /key /window /run /adb
+v1.1.1 fix: /uidump now PULLS the xml instead of `adb shell cat` -- cat output
+  was truncated to the last 20KB, corrupting the XML on complex screens.
 """
 
 import base64
@@ -37,7 +39,7 @@ pyautogui.PAUSE = 0.05
 TOKEN = "Czj3u9HadjO-PkEMw9X9VR_S02v_ZXKMD9CcFT1WADs"
 HOST = "127.0.0.1"          # localhost only -- never change to 0.0.0.0
 PORT = 8787
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 AGENT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 MACRO_TIME_CAP = 30.0       # seconds per /macro call (tunnel friendly)
@@ -516,12 +518,24 @@ def uidump(inp: UiDumpIn, request: Request):
     dump = run_process(pre + ["shell", "uiautomator", "dump", "/sdcard/aidump.xml"], 30)
     if dump["exit"] != 0:
         return {"ok": False, "error": "dump failed", "stderr": dump["stderr"]}
-    cat = run_process(pre + ["shell", "cat", "/sdcard/aidump.xml"], 30)
+    # v1.1.1: pull the file instead of `adb shell cat` -- run_process truncates
+    # stdout to the LAST 20KB, which cuts off the XML root on complex screens.
+    local_xml = os.path.join(AGENT_ROOT, "aidump.xml")
+    pull = run_process(pre + ["pull", "/sdcard/aidump.xml", local_xml], 30)
     run_process(pre + ["shell", "rm", "/sdcard/aidump.xml"], 10)
+    if pull["exit"] != 0 or not os.path.isfile(local_xml):
+        return {"ok": False, "error": "pull failed", "stderr": pull["stderr"]}
     try:
-        root = ET.fromstring(cat["stdout"])
+        with open(local_xml, "r", encoding="utf-8", errors="replace") as f:
+            xml_text = f.read()
+        root = ET.fromstring(xml_text)
     except Exception as e:
-        return {"ok": False, "error": "xml parse failed: %s" % e, "raw": cat["stdout"][:2000]}
+        return {"ok": False, "error": "xml parse failed: %s" % e}
+    finally:
+        try:
+            os.remove(local_xml)
+        except OSError:
+            pass
     nodes = []
     for node in root.iter("node"):
         m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.get("bounds", ""))

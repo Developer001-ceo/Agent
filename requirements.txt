@@ -3,3 +3,4 @@ uvicorn
 pyautogui
 pillow
 pywinauto
+pygetwindow
