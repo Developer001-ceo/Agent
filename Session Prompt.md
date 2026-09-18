@@ -15,12 +15,13 @@ AI sandbox ──outbound HTTPS──> Cloudflare edge <──outbound tunnel─
 
 # CURRENT STATE ON MY PC (verify, don't redo)
 - Windows PC hostname WIN-36BCA2MFOGK, user prasa, screen 2560×1600, Python 3.12.0
-- Agent folder: `C:\Users\prasa\Music\Agent` — agent.py, start.bat, run-everything.bat, restart_agent.ps1, requirements.txt, Session Prompt.md (all scripts use %~dp0/$PSScriptRoot — folder is relocatable)
+- Agent folder: `C:\Users\prasa\Music\Agent` — agent.py (v1.2.1), start.bat, run-everything.bat, restart_agent.ps1, requirements.txt, Session Prompt.md, start_chrome_debug.bat, install_watchdog.ps1, watchdog_task.ps1, jobs\ (job logs). All scripts use %~dp0/$PSScriptRoot — folder is relocatable.
 - cloudflared.exe available (PATH or agent folder)
 - adb at %LOCALAPPDATA%\Android\Sdk\platform-tools — usually NO device attached; ask me to plug in + enable USB debugging before any Android work
-- pip packages: fastapi, uvicorn, pyautogui, pillow, pywinauto, pygetwindow
+- pip packages: fastapi, uvicorn, pyautogui, pillow, pywinauto, pygetwindow, playwright
+- Web testing: Chrome must be started via start_chrome_debug.bat (CDP port 9222) before /web/* works
 
-# AGENT API SPEC (v1.1.1 — EXACT, matches agent.py; wrong endpoint/fields = 422/404)
+# AGENT API SPEC (v1.2.1 — EXACT, matches agent.py; wrong endpoint/fields = 422/404)
 FastAPI on 127.0.0.1:8787. Bearer check on everything except /ping (401 on bad token). JSON in/out.
 - GET  /ping       → {"ok":true,"ts":...}  (no auth — connectivity check)
 - GET  /health     → {ok, host, screen{width,height}, adb, pywinauto, agent_version}
@@ -45,6 +46,23 @@ FastAPI on 127.0.0.1:8787. Bearer check on everything except /ping (401 on bad t
     → {ok,elapsed,results:[{i,action,ok,detail|error}],screenshot:<b64 jpeg|null>} (whole macro capped 30s)
 - POST /upload     {"path":"agent_new.py","data":"<base64>","append":false} — sandboxed to the agent folder; chunk by appending (chunk the BINARY before encoding)
 - POST /download   {"path":"results.json"} → {ok,path,bytes,data:"<base64>"} (≤80MB)
+----------------------------- v1.2 additions -----------------------------
+- POST /uiset      {"title","name","value","control_type":null,"index":0} → set text on a control (Edit: set_edit_text, else focus+paste)
+- POST /clipboard  {"action":"get|set","text":"..."} → get returns {"text":...}
+- POST /type       also accepts "paste":true → clipboard paste; NON-ASCII text auto-pastes (response has "method")
+- GET  /windows    → {titles:[...], windows:[{title,pid,exe}]}
+- GET  /proc?name=python&limit=60 → {processes:[{name,pid,mem}]}
+- POST /kill       {"pid":123} or {"name":"app.exe"} (agent refuses its own pid)
+- POST /awake      {"on":true} → suppress sleep during long tests; turn OFF after
+- POST /job/start  {"command":"...","shell":"powershell","name":"build"} → {job:{id}} — background, for long builds/installs
+- POST /job/status {"id":"j0001"} → {running,exit,tail(last ~8KB)};  POST /job/list → all;  POST /job/stop {"id"}
+- GET  /devscreen?serial= → ANDROID screen as raw PNG bytes (adb screencap — no mirroring needed)
+- POST /uiclick_android {"text":"Login"} or {"res":"com.x:id/btn"} (+index,serial,long_press) → finds node in dump, taps center
+- POST /logcat     {"lines":200,"filter":"*:E","clear":false,"serial":null} → logcat tail
+- POST /adbapp     {"action":"install|uninstall|launch|stop|clear|packages|devices","package":"com.x","apk":"app.apk(in agent folder)","serial":null}
+- POST /web/open   {"url":"https://x","new_tab":false} → drive YOUR Chrome via CDP (needs start_chrome_debug.bat + playwright)
+- POST /web/click  {"selector":"#id"};  POST /web/fill {"selector","text"};  POST /web/eval {"expression"}
+- GET  /web/state  → {title,url};  GET /web/console?clear= → {console:[],errors:[]};  GET /web/snapshot → {title,url,elements:[interactive],text}
 - NOTE: there is NO GET / status page and NO /exec endpoint — /run is the executor.
 
 # BOOTSTRAP PROCEDURE (fresh session)
