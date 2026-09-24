@@ -64,7 +64,7 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-BAR_VERSION = "1.4.0"
+BAR_VERSION = "1.5.1"
 AGENT_URL = os.environ.get("AGENT_URL", "http://127.0.0.1:8787").rstrip("/")
 SINGLETON_PORT = int(os.environ.get("INDICATOR_PORT", "8799"))
 KEY_FILE = os.path.join(HERE, "indicator.key")

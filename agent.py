@@ -1,6 +1,33 @@
 """
-agent.py -- Remote Test Agent for Windows  (v1.3.1)
+agent.py -- Remote Test Agent for Windows  (v1.5.0)
 ====================================================
+v1.5.0 SPEED REDESIGN ("semantic-first" control -- 10-20x faster, fewer errors):
+  ROOT CAUSE of the 1-2 minute pauses in v1.4.0 sessions: the AI looked at
+  the screen with screenshots + external vision-model analysis before every
+  click (30-120s per action) and the guessed coordinates caused retries.
+  THE FIX: the UIA semantic tree IS the eyes -- exact names + rects, no vision
+  in the control loop. Screenshots (jpeg q=60) only to VERIFY milestones.
+  GET  /screen          -> whole semantic desktop in ONE call:
+                           overview mode: every top-level window + rect (+ a
+                           shallow element list per window)
+                           query mode: /screen?query=Text+Document finds that
+                           element across ALL windows -- including open context
+                           menus / submenus, which have no title -- and returns
+                           its exact rect. First matching window wins.
+  GET  /ui?query=       -> server-side name filter: return ONLY the matching
+                           elements (tiny response, one round trip)
+  POST /uiclick         -> title now OPTIONAL: omit it to search every window
+                           (that is how you click context-menu items); new
+                           button / double / wait_ms (retries until the element
+                           appears -- menus animate in); rect-center pyautogui
+                           click as fallback when click_input fails.
+  POST /uiset           -> title optional too.
+  /macro                -> new step actions "uiclick" and "uiset" so a WHOLE
+                           flow (right-click -> New -> Text Document -> type)
+                           runs in ONE server-side call, zero round trips.
+  GZip middleware       -> JSON responses compressed (5-10x smaller through
+                           the tunnel: /ui, /screen, /windows, ...)
+
 v1.3.1 fixes (all three user-reported):
   TIMER FREEZES WHEN THE AI DISCONNECTS
     GET /indicator now returns task.elapsed = ACTIVE seconds on the task
@@ -78,6 +105,7 @@ import xml.etree.ElementTree as ET
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from PIL import Image
@@ -91,7 +119,7 @@ pyautogui.PAUSE = 0.05
 TOKEN = "Czj3u9HadjO-PkEMw9X9VR_S02v_ZXKMD9CcFT1WADs"
 HOST = "127.0.0.1"          # localhost only -- never change to 0.0.0.0
 PORT = 8787
-VERSION = "1.4.0"
+VERSION = "1.5.1"
 AGENT_ROOT = os.path.dirname(os.path.abspath(__file__))
 JOBS_DIR = os.path.join(AGENT_ROOT, "jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
@@ -101,6 +129,9 @@ MACRO_SLEEP_CAP = 10.0      # max seconds per sleep step
 MACRO_RUN_CAP = 25          # max timeout per run step inside a macro
 
 app = FastAPI(title="win-agent", docs_url=None, redoc_url=None, openapi_url=None)
+# v1.5.0: compress JSON responses (5-10x smaller through the tunnel: /ui,
+# /screen, /windows ...). Only kicks in when the client sends Accept-Encoding.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 _input_lock = threading.Lock()      # serialize mouse/keyboard/UI actions
 JOBS = {}                           # id -> job dict
@@ -387,18 +418,22 @@ class AdbIn(BaseModel):
 
 
 class UiClickIn(BaseModel):
-    title: str
+    title: Optional[str] = None        # v1.5.0: None/omitted = search ALL windows
     name: str
     control_type: Optional[str] = None
     index: int = 0
+    button: str = "left"               # v1.5.0: left|right|middle
+    double: bool = False               # v1.5.0: double-click
+    wait_ms: int = 0                   # v1.5.0: retry until the element appears
 
 
 class UiSetIn(BaseModel):
-    title: str
+    title: Optional[str] = None        # v1.5.0: None/omitted = search ALL windows
     name: str
     value: str
     control_type: Optional[str] = None
     index: int = 0
+    wait_ms: int = 0                   # v1.5.0: retry until the element appears
 
 
 class UiDumpIn(BaseModel):
@@ -720,8 +755,9 @@ def _wrap_info(ctrl) -> dict:
         return {"type": "?", "name": "<unreadable>", "rect": None, "center": None, "enabled": False}
 
 
-def _uia_match(win, name: str, control_type: Optional[str] = None):
-    wrappers = _collect_wrappers(win, 12, 800)
+def _uia_match(win, name: str, control_type: Optional[str] = None,
+               max_depth: int = 12, max_nodes: int = 800):
+    wrappers = _collect_wrappers(win, max_depth, max_nodes)
     matches = []
     for ctrl in wrappers[1:]:
         info = _wrap_info(ctrl)
@@ -730,6 +766,116 @@ def _uia_match(win, name: str, control_type: Optional[str] = None):
                 continue
             matches.append((ctrl, info))
     return matches
+
+
+def _find_in_window(title, name, control_type=None, timeout_ms=0):
+    """v1.5.0: search ONE titled window for an element, retrying until
+    timeout_ms (windows and elements can appear a beat late). Returns
+    (window_title, matches) -- matches empty when not found."""
+    deadline = time.time() + max(0.0, min(int(timeout_ms), 15000)) / 1000.0
+    while True:
+        win = _find_window_uia(title)
+        matches, wt = [], ""
+        if win is not None:
+            try:
+                wt = win.window_text() or ""
+            except Exception:
+                wt = ""
+            try:
+                matches = _uia_match(win, name, control_type)
+            except Exception:
+                matches = []
+        if matches or time.time() >= deadline:
+            return wt, matches
+        time.sleep(0.12)
+
+
+def _uia_find_any(name, control_type=None, timeout_ms=0):
+    """v1.5.0: search EVERY top-level window (z-order: menus are on top, so
+    they are hit first) for an element by name; retry until timeout_ms.
+    This is how you click items of open context menus / submenus -- they
+    live in untitled windows. Returns (window_title, matches)."""
+    deadline = time.time() + max(0.0, min(int(timeout_ms), 15000)) / 1000.0
+    while True:
+        try:
+            wins = _uia_desktop().windows()
+        except HTTPException:
+            raise
+        except Exception:
+            wins = []
+        for w in wins:
+            try:
+                matches = _uia_match(w, name, control_type,
+                                     max_depth=10, max_nodes=400)
+            except Exception:
+                continue
+            if matches:
+                try:
+                    wt = w.window_text() or ""
+                except Exception:
+                    wt = ""
+                return wt, matches
+        if time.time() >= deadline:
+            return "", []
+        time.sleep(0.12)
+
+
+def _uia_click_it(ctrl, info, button="left", double=False):
+    """v1.5.0: real click on a UIA wrapper with a rect-center pyautogui
+    fallback. Returns the method used. Raises when both paths fail."""
+    try:
+        ctrl.click_input(button=button, double=double)
+        return "click_input"
+    except Exception:
+        c = info.get("center")
+        if not c:
+            raise
+        pyautogui.click(x=c[0], y=c[1], clicks=2 if double else 1, button=button)
+        return "rect-center-fallback"
+
+
+def _uia_readback(ctrl):
+    """v1.5.1: best-effort read of an element's current text (Value pattern
+    first, then window text). None when the control cannot be read."""
+    for how in ("get_value", "window_text"):
+        try:
+            v = getattr(ctrl, how)()
+            if isinstance(v, str) and v:
+                return v
+        except Exception:
+            pass
+    return None
+
+
+def _uia_paste_into(ctrl, info, value):
+    """v1.5.1: bulletproof paste for edit controls that reject set_edit_text
+    (the Win11 Store Notepad 'Text Editor' does). Clicks the element's rect
+    center for a REAL focus, pastes, verifies via readback when possible and
+    retries once. Returns the method string; raises when a readable readback
+    proves the paste did not land."""
+    probe = (value.splitlines() or [value])[0][:60] if value else ""
+    last_rb = None
+    for _attempt in (1, 2):
+        try:
+            c = info.get("center")
+            if c:
+                pyautogui.click(x=c[0], y=c[1])
+            else:
+                ctrl.set_focus()
+        except Exception:
+            ctrl.set_focus()
+        time.sleep(0.15)
+        _clipboard_set(value)
+        pyautogui.hotkey("ctrl", "v", interval=0.05)
+        time.sleep(0.12)
+        rb = _uia_readback(ctrl)
+        if rb is None:
+            return "click+paste (unverified)"
+        last_rb = rb
+        if not probe or probe in rb:
+            return "click+paste+verified"
+    raise RuntimeError("paste verification failed: readback %r does not "
+                       "contain %r" % (last_rb[:80], probe))
 
 
 # ------------------------------------------------- android ui dump helper ----
@@ -817,7 +963,10 @@ def _s_type(s):
 def _s_key(s):
     keys = s["keys"]
     if s.get("combo"):
-        pyautogui.hotkey(*keys)
+        # v1.5.1: interval=0.05 -- Store apps (Win11 Notepad etc.) drop
+        # ultra-fast synthetic combos; 50ms between keys is still instant
+        # for a human observer but registers reliably everywhere.
+        pyautogui.hotkey(*keys, interval=0.05)
     else:
         for k in keys:
             pyautogui.press(k)
@@ -867,10 +1016,62 @@ def _s_adb(s):
     return run_process([path] + s["args"], min(int(s.get("timeout", 25)), MACRO_RUN_CAP))
 
 
+def _s_uiclick(s):
+    """v1.5.0: semantic click inside a macro (see /uiclick). Whole flows --
+    right-click, menu, submenu, rename, save -- run in ONE server-side call
+    with zero tunnel round trips between the clicks."""
+    name = s["name"]
+    title = s.get("title")
+    control_type = s.get("control_type")
+    index = int(s.get("index", 0))
+    button = s.get("button", "left")
+    double = bool(s.get("double", False))
+    wait_ms = int(s.get("wait_ms", 0))
+    if button not in ("left", "right", "middle"):
+        raise RuntimeError("uiclick: button must be left|right|middle")
+    if title:
+        wt, matches = _find_in_window(title, name, control_type, wait_ms)
+    else:
+        wt, matches = _uia_find_any(name, control_type, wait_ms)
+    if not matches:
+        raise RuntimeError("uiclick: no element named ~%r" % name)
+    if index >= len(matches):
+        raise RuntimeError("uiclick: only %d matches for ~%r" % (len(matches), name))
+    ctrl, info = matches[index]
+    method = _uia_click_it(ctrl, info, button, double)
+    return {"window": wt, "clicked": info, "method": method}
+
+
+def _s_uiset(s):
+    """v1.5.0: semantic set-text inside a macro (see /uiset)."""
+    name, value = s["name"], s["value"]
+    title = s.get("title")
+    control_type = s.get("control_type")
+    index = int(s.get("index", 0))
+    wait_ms = int(s.get("wait_ms", 0))
+    if title:
+        wt, matches = _find_in_window(title, name, control_type, wait_ms)
+    else:
+        wt, matches = _uia_find_any(name, control_type, wait_ms)
+    if not matches:
+        raise RuntimeError("uiset: no element named ~%r" % name)
+    if index >= len(matches):
+        raise RuntimeError("uiset: only %d matches for ~%r" % (len(matches), name))
+    ctrl, info = matches[index]
+    try:
+        ctrl.set_edit_text(value)
+        return {"window": wt, "element": info, "method": "set_edit_text"}
+    except Exception:
+        # v1.5.1: click+paste+verify (see _uia_paste_into)
+        method = _uia_paste_into(ctrl, info, value)
+        return {"window": wt, "element": info, "method": method}
+
+
 MACRO_ACTIONS = {
     "click": _s_click, "move": _s_move, "drag": _s_drag, "scroll": _s_scroll,
     "type": _s_type, "key": _s_key, "sleep": _s_sleep, "window": _s_window,
     "run": _s_run, "adb": _s_adb,
+    "uiclick": _s_uiclick, "uiset": _s_uiset,      # v1.5.0 semantic steps
 }
 
 
@@ -1129,7 +1330,7 @@ def key(inp: KeyIn, request: Request):
         raise HTTPException(status_code=400, detail="keys required")
     with _input_lock:
         if inp.combo:
-            pyautogui.hotkey(*inp.keys)
+            pyautogui.hotkey(*inp.keys, interval=0.05)   # v1.5.1: reliable vs Store apps
         else:
             for k in inp.keys:
                 pyautogui.press(k)
@@ -1165,7 +1366,8 @@ def adb(inp: AdbIn, request: Request):
 
 # --------------------------------------------------- v1.1: element tree ----
 @app.get("/ui")
-def ui_tree(request: Request, title: str, max_depth: int = 10, max_nodes: int = 500):
+def ui_tree(request: Request, title: str, max_depth: int = 10, max_nodes: int = 500,
+            query: str = ""):
     guard(request)
     win = _find_window_uia(title)
     if win is None:
@@ -1175,11 +1377,15 @@ def ui_tree(request: Request, title: str, max_depth: int = 10, max_nodes: int = 
         wrappers = _collect_wrappers(win, min(max_depth, 12), min(max_nodes, 800))
     except Exception as e:
         return {"ok": False, "error": "tree walk failed: %s" % e}
+    q = (query or "").strip().lower()
     for ctrl in wrappers[1:]:        # skip the top window itself
         if len(nodes) >= min(max_nodes, 800):
             truncated = True
             break
-        nodes.append(_wrap_info(ctrl))
+        info = _wrap_info(ctrl)
+        if q and q not in (info.get("name") or "").lower():
+            continue                 # v1.5.0: server-side name filter
+        nodes.append(info)
     try:
         win_title = win.window_text()
     except Exception:
@@ -1188,22 +1394,86 @@ def ui_tree(request: Request, title: str, max_depth: int = 10, max_nodes: int = 
             "truncated": truncated, "elements": nodes}
 
 
+@app.get("/screen")
+def screen(request: Request, query: str = "", elements: bool = True,
+           depth: int = 3, per_window: int = 30):
+    """v1.5.0: the semantic screen -- ONE call instead of screenshot + vision
+    analysis. Overview mode (no query): every top-level window + rect (+ a
+    shallow element list each). Query mode: /screen?query=Text+Document
+    finds that element in ANY window (open context menus / submenus included
+    -- they have no title) and returns exact rects; first matching window
+    wins. This is the fast way to answer where-is-X-on-screen-right-now
+    without any screenshot."""
+    guard(request)
+    if (query or "").strip():
+        for w in _uia_desktop().windows():
+            try:
+                matches = _uia_match(w, query, None, max_depth=10, max_nodes=400)
+            except Exception:
+                continue
+            if matches:
+                try:
+                    wt = w.window_text() or ""
+                except Exception:
+                    wt = ""
+                return {"ok": True, "query": query, "window": wt,
+                        "matches": [info for _, info in matches[:20]]}
+        return {"ok": True, "query": query, "window": None, "matches": []}
+    depth = max(1, min(depth, 8))
+    per_window = max(1, min(per_window, 120))
+    out = []
+    for w in _uia_desktop().windows():
+        info = _wrap_info(w)
+        entry = {"title": (info.get("name") or "")[:120],
+                 "type": info.get("type"), "rect": info.get("rect"),
+                 "center": info.get("center")}
+        try:
+            entry["pid"] = w.element_info.process_id
+            entry["exe"] = _pid_exe(entry["pid"])
+        except Exception:
+            pass
+        if elements:
+            els = []
+            try:
+                wrappers = _collect_wrappers(w, depth, per_window + 1)
+            except Exception:
+                wrappers = []
+            for ctrl in wrappers[1:]:          # skip the window itself
+                if len(els) >= per_window:
+                    break
+                ei = _wrap_info(ctrl)
+                els.append({"type": ei.get("type"), "name": ei.get("name"),
+                            "rect": ei.get("rect"), "center": ei.get("center")})
+            entry["elements"] = els
+        out.append(entry)
+    return {"ok": True, "count": len(out), "windows": out}
+
+
 @app.post("/uiclick")
 def uiclick(inp: UiClickIn, request: Request):
+    """v1.5.0: click a UIA element by name. Omit title/null to search ALL
+    top-level windows -- that is how you click context-menu / submenu items
+    (they live in untitled windows on top of the z-order). button / double /
+    wait_ms are new; a rect-center pyautogui click is the fallback if
+    click_input fails. Real mouse click either way -- the user sees it."""
     guard(request)
-    win = _find_window_uia(inp.title)
-    if win is None:
-        return {"ok": False, "error": "no top-level window matching %r" % inp.title}
-    matches = _uia_match(win, inp.name, inp.control_type)
+    if inp.button not in ("left", "right", "middle"):
+        return {"ok": False, "error": "button must be left|right|middle"}
+    if inp.title:
+        wt, matches = _find_in_window(inp.title, inp.name, inp.control_type,
+                                      inp.wait_ms)
+    else:
+        wt, matches = _uia_find_any(inp.name, inp.control_type, inp.wait_ms)
     if not matches:
-        return {"ok": False, "error": "no element named ~%r" % inp.name}
+        return {"ok": False, "error": "no element named ~%r%s" % (
+            inp.name, " (waited %dms)" % inp.wait_ms if inp.wait_ms else "")}
     if inp.index >= len(matches):
         return {"ok": False, "error": "only %d matches" % len(matches)}
     ctrl, info = matches[inp.index]
     with _input_lock:
         try:
-            ctrl.click_input()
-            return {"ok": True, "clicked": info}
+            method = _uia_click_it(ctrl, info, inp.button, inp.double)
+            return {"ok": True, "window": wt, "clicked": info, "method": method}
         except Exception as e:
             return {"ok": False, "error": "click failed: %s" % e, "element": info}
 
@@ -1236,7 +1506,8 @@ def macro(inp: MacroIn, request: Request):
                             "error": "macro time cap (%.0fs) reached" % MACRO_TIME_CAP})
             break
         try:
-            if action in ("click", "move", "drag", "scroll", "type", "key", "window"):
+            if action in ("click", "move", "drag", "scroll", "type", "key", "window",
+                          "uiclick", "uiset"):
                 with _input_lock:
                     detail = MACRO_ACTIONS[action](s)
             else:
@@ -1294,10 +1565,11 @@ def download(inp: DownloadIn, request: Request):
 @app.post("/uiset")
 def uiset(inp: UiSetIn, request: Request):
     guard(request)
-    win = _find_window_uia(inp.title)
-    if win is None:
-        return {"ok": False, "error": "no top-level window matching %r" % inp.title}
-    matches = _uia_match(win, inp.name, inp.control_type)
+    if inp.title:
+        wt, matches = _find_in_window(inp.title, inp.name, inp.control_type,
+                                      inp.wait_ms)
+    else:
+        wt, matches = _uia_find_any(inp.name, inp.control_type, inp.wait_ms)
     if not matches:
         return {"ok": False, "error": "no element named ~%r" % inp.name}
     if inp.index >= len(matches):
@@ -1309,11 +1581,9 @@ def uiset(inp: UiSetIn, request: Request):
                 ctrl.set_edit_text(inp.value)
                 return {"ok": True, "method": "set_edit_text", "element": info}
             except Exception:
-                ctrl.set_focus()
-                time.sleep(0.15)
-                _clipboard_set(inp.value)
-                pyautogui.hotkey("ctrl", "v")
-                return {"ok": True, "method": "focus+paste", "element": info}
+                # v1.5.1: click+paste+verify (see _uia_paste_into)
+                method = _uia_paste_into(ctrl, info, inp.value)
+                return {"ok": True, "method": method, "element": info}
         except Exception as e:
             return {"ok": False, "error": "set failed: %s" % str(e)[:200], "element": info}
 

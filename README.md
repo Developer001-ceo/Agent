@@ -7,7 +7,7 @@ ONE folder, SIX files. `run.bat` is the only file you ever need to touch.
 | file | purpose |
 |---|---|
 | `run.bat` | **THE runner.** start / restart / stop / status / tunnel / chrome / bar / watchdog / deps |
-| `agent.py` | the automation server (FastAPI on 127.0.0.1:8787, localhost only) — v1.4.0 |
+| `agent.py` | the automation server (FastAPI on 127.0.0.1:8787, localhost only) — v1.5.1 |
 | `indicator.py` | the thin **indicator bar** overlay (see below) — spawns automatically, needs only stdlib tkinter |
 | `requirements.txt` | python dependencies (installed automatically on first start) |
 | `README.md` | this file: quick start + full API spec + AI session prompt |
@@ -16,11 +16,11 @@ ONE folder, SIX files. `run.bat` is the only file you ever need to touch.
 `jobs\` is a data folder for background-job logs, created automatically.
 `indicator.key` / `indicator.stop` / `indicator.log` are tiny auto-managed data files for the indicator bar — leave them alone.
 
-## Indicator bar (v1.4.0 — what you'll see)
+## Indicator bar (v1.5.1 — what you'll see)
 A THIN always-on-top strip at the top of your screen:
 
 ```
-[ ● ]  AI connected — controlling your PC  │  Doing: Opening Notepad to draft the report   [ 00:42 ]   win-agent v1.4.0  ✕
+[ ● ]  AI connected — controlling your PC  │  Doing: Opening Notepad to draft the report   [ 00:42 ]   win-agent v1.5.1  ✕
 ```
 
 - **Light — pure CONNECTION state.** GREEN = the AI is connected and has access (pulsing while it is actively working or thinking). RED = the AI is disconnected / idle past the threshold (`AGENT_IDLE_RED_SECONDS`, default 45s) or the agent is down. Task outcomes (done/failed) NEVER change the light — a finished task keeps the light green while the AI is still connected.
@@ -53,7 +53,7 @@ A THIN always-on-top strip at the top of your screen:
 ## Upgrading agent.py (this is what the AI does remotely)
 Upload `agent_new.py` → `python -m py_compile` gate → `run.bat restart`.
 If the compile check fails, the old agent.py keeps running — a bad upload can never take the agent down.
-(Upgrading to v1.4.0: replace agent.py, indicator.py **and** Prompt.md together — the new thinking state, connection-only light and /find endpoints ship as a set. A mismatched pair still works, it just falls back to the old behavior. Then `run.bat restart`, and `run.bat bar` if the bar did not respawn.)
+(Upgrading to v1.5.1: replace agent.py, indicator.py **and** Prompt.md together — the semantic-first speed kit (/screen, /ui?query=, /uiclick without title, macro uiclick/uiset steps, gzip) ships as a set. A mismatched pair still works, it just falls back to the old behavior. Then `run.bat restart`, and `run.bat bar` if the bar did not respawn.)
 
 ---
 # MASTER PROMPT — Windows Remote Agent via Cloudflare Tunnel (paste into a new AI session)
@@ -73,15 +73,15 @@ AI sandbox ──outbound HTTPS──> Cloudflare edge <──outbound tunnel─
 
 # CURRENT STATE ON MY PC (verify, don't redo)
 - Windows PC hostname WIN-36BCA2MFOGK, user prasa, screen 2560×1600, Python 3.12.0
-- Agent folder: `C:\Users\prasa\Downloads\Agent` — exactly SIX files: agent.py (v1.4.0), indicator.py, run.bat, requirements.txt, README.md, Prompt.md. Plus data: `jobs\` (job logs) and indicator.key/indicator.log (auto-managed by the bar). All portability lives in run.bat (%~dp0).
+- Agent folder: the folder the user deployed to — READ IT from the banner of their run.bat window (the `Jobs log dir` line, e.g. `C:\Users\prasa\Downloads\torfm5`); it changes between deployments. Exactly SIX files: agent.py (v1.5.1), indicator.py, run.bat, requirements.txt, README.md, Prompt.md. Plus data: `jobs\` (job logs) and indicator.key/indicator.log (auto-managed by the bar). All portability lives in run.bat (%~dp0).
 - run.bat is the single runner: `run.bat` starts agent+tunnel (the indicator bar spawns automatically); `run.bat restart` swaps agent_new.py (compile-gated) and restarts; `run.bat chrome` restarts Chrome with CDP 9222; `run.bat bar` restarts just the indicator bar; `run.bat stop` closes agent + bar; `run.bat watchdog-install` registers a 1-minute auto-restart task.
-- INDICATOR BAR (v1.4.0): the user watches a thin always-on-top strip. The LIGHT + status sentence are PURE CONNECTION STATE — green = you are connected and have access (pulsing while you are actively working or thinking), red = you are disconnected/idle > AGENT_IDLE_RED_SECONDS (default 45) or the agent is down. Task outcomes NEVER change the light. The task slot says what you are doing: "Doing: <task>" (live timer), "Thinking: <reason>" (amber, timer keeps running), "Done: <task> — took MM:SS", "Failed: <task> — <reason> — after MM:SS", "Paused: <task>" (frozen dim timer while you are away). The timer FREEZES while you are disconnected and resumes if you reconnect to the same task; the bar never appears in screenshots (auto-excluded). Announce with POST /task — see API spec.
+- INDICATOR BAR (v1.5.0): the user watches a thin always-on-top strip. The LIGHT + status sentence are PURE CONNECTION STATE — green = you are connected and have access (pulsing while you are actively working or thinking), red = you are disconnected/idle > AGENT_IDLE_RED_SECONDS (default 45) or the agent is down. Task outcomes NEVER change the light. The task slot says what you are doing: "Doing: <task>" (live timer), "Thinking: <reason>" (amber, timer keeps running), "Done: <task> — took MM:SS", "Failed: <task> — <reason> — after MM:SS", "Paused: <task>" (frozen dim timer while you are away). The timer FREEZES while you are disconnected and resumes if you reconnect to the same task; the bar never appears in screenshots (auto-excluded). Announce with POST /task — see API spec.
 - cloudflared.exe available (PATH or agent folder)
 - adb at %LOCALAPPDATA%\Android\Sdk\platform-tools — usually NO device attached; ask me to plug in + enable USB debugging before any Android work
 - pip packages: fastapi, uvicorn, pyautogui, pillow, pywinauto, pygetwindow, playwright
 - Web testing: Chrome must be started via `run.bat chrome` (CDP port 9222) before /web/* works
 
-# AGENT API SPEC (v1.4.0 — EXACT, matches agent.py; wrong endpoint/fields = 422/404)
+# AGENT API SPEC (v1.5.1 — EXACT, matches agent.py; wrong endpoint/fields = 422/404)
 FastAPI on 127.0.0.1:8787. Bearer check on everything except /ping (401 on bad token). JSON in/out.
 - GET  /ping       → {"ok":true,"ts":...}  (no auth — connectivity check)
 - GET  /health     → {ok, host, screen{width,height}, adb, pywinauto, playwright, awake, indicator, agent_version}
@@ -96,18 +96,20 @@ FastAPI on 127.0.0.1:8787. Bearer check on everything except /ping (401 on bad t
 - POST /run        {"command":"...","shell":"powershell|cmd","timeout":120} → {exit,stdout,stderr,ok} (stdout/stderr = LAST 20KB)
 - POST /adb        {"args":["devices"],"timeout":120} → same shape as /run
 - GET  /windows    → {titles:[...top 200...], windows:[{title,pid,exe}]}
-- GET  /ui?title=Notepad&max_depth=10&max_nodes=500 → {ok,window,count,truncated,elements:[{type,name,auto_id,rect,center,enabled}]}
-- POST /uiclick    {"title":"Notepad","name":"OK","control_type":null,"index":0} → real-mouse-clicks element whose name CONTAINS "name"
+- GET  /screen    → semantic desktop in ONE call (see v1.5.0 additions below)
+- GET  /ui?title=Notepad&max_depth=10&max_nodes=500&query=OK → {ok,window,count,truncated,elements:[{type,name,auto_id,rect,center,enabled}]}; &query= filters server-side (return ONLY matching elements — tiny response)
+- POST /uiclick    {"name":"OK","title":null,"control_type":null,"index":0,"button":"left","double":false,"wait_ms":0} → real-mouse-clicks element whose name CONTAINS "name"; omit "title" to search ALL windows (context menus!); "wait_ms" retries until it appears
 - POST /uidump     {"serial":null} → {ok,count,elements:[{text,desc,res,class,clickable,bounds,center}]}
 - POST /macro      {"steps":[{"action":"click","x":10,"y":20},...],"stop_on_error":true,"capture":true,"screenshot_q":80}
     step actions: click{x,y,clicks,button} move{x,y,duration} drag{x1,y1,x2,y2,duration} scroll{dx,dy}
                   type{text,interval} key{keys,combo} sleep{ms ≤10000} window{title,op}
                   run{command,shell,timeout ≤25} adb{args,timeout}
+                  uiclick{name,title?,control_type?,index,button,double,wait_ms} uiset{name,title?,value,index,wait_ms}  (v1.5.0)
     → {ok,elapsed,results:[{i,action,ok,detail|error}],screenshot:<b64 jpeg|null>} (whole macro capped 30s)
 - POST /upload     {"path":"agent_new.py","data":"<base64>","append":false} — sandboxed to the agent folder; chunk by appending (chunk the BINARY before encoding)
 - POST /download   {"path":"results.json"} → {ok,path,bytes,data:"<base64>"} (≤80MB)
 ----------------------------- v1.2 additions -----------------------------
-- POST /uiset      {"title","name","value","control_type":null,"index":0} → set text on a control (Edit: set_edit_text, else focus+paste)
+- POST /uiset      {"name":"New folder","value":"...","title":null,"control_type":null,"index":0,"wait_ms":0} → set text on a control (Edit: set_edit_text, else focus+paste); omit "title" to search ALL windows
 - POST /clipboard  {"action":"get|set","text":"..."} → get returns {"text":...}
 - GET  /proc?name=python&limit=60 → {processes:[{name,pid,mem}]}
 - POST /kill       {"pid":123} or {"name":"app.exe"} (agent refuses its own pid)
@@ -136,6 +138,22 @@ FastAPI on 127.0.0.1:8787. Bearer check on everything except /ping (401 on bad t
 - POST /task new state "thinking": {"state":"thinking","reason":"window did not open, looking for it again"} — announce it EVERY time you pause to analyze the screen or recover from a failure/error; the bar shows "Thinking: <reason>" in amber while the task timer keeps running. Passing a NEW task label with state=thinking starts that task at 0.
 - /task accepts "reason" on done/fail too: {"state":"fail","reason":"menu item was greyed out"} → bar shows "Failed: <task> — <reason>".
 - THE LIGHT IS CONNECTION-ONLY: green = you have access, red = you do not. Done/failed tasks never change it — the outcome lives in the task slot text.
+----------------------------- v1.5.0 additions (SPEED: 10-20x faster) -----------------------------
+- GET  /screen    → the semantic screen, ONE call, NO vision model needed. Without query: {ok,count,windows:[{title,type,rect,center,pid,exe,elements:[{type,name,rect,center},...]}]} (params elements=true&depth=3&per_window=30; elements=false = windows+rects only, fastest). With ?query=Text+Document: searches EVERY top-level window — including OPEN context menus / submenus, which have no title — and returns {ok,query,window,matches:[{type,name,auto_id,rect,center,enabled},...]} (first matching window wins, max 20). This answers "where is X on screen right now?" in ~1-3s.
+- GET  /ui         → new optional &query=<substring>: server-side name filter, tiny response.
+- POST /uiclick    → "title" now OPTIONAL: omit it to search all windows (that is how you click context-menu / submenu items). New: "button":"left|right|middle", "double":bool, "wait_ms":int (retries until the element appears — menus animate in). Fallback to a rect-center pyautogui click if click_input fails; response "method" says which ran.
+- POST /uiset      → "title" optional + "wait_ms" (same search semantics).
+- POST /macro      → new step actions "uiclick" and "uiset" so a WHOLE flow (right-click → New → Text Document → type → Ctrl+S) runs in ONE server-side call — zero round trips between clicks.
+- GZip            → JSON responses are gzip-compressed when your client sends Accept-Encoding: gzip (5-10x smaller through the tunnel — requests/httpx do this automatically; raw urllib does NOT).
+- SPEED DOCTRINE  → semantic-first, vision-to-verify (see WORKING CONVENTIONS). Screenshot+vision analysis is the LAST resort, for non-UIA targets only.
+
+----------------------------- v1.5.1 additions (live-session hardening) -----------------------------
+- HOTKEY TIMING: every combo (POST /key, macro "key" steps, internal ctrl+v) now uses pyautogui interval=0.05 — Win11 Store apps (Notepad!) silently DROP ultra-fast synthetic combos. 50ms between keys is invisible to a human but registers everywhere. Live bug this fixes: Ctrl+S never fired in Win11 Notepad while the pasted text sat in the editor (paste worked, save did not).
+- /uiset + macro uiset FALLBACK UPGRADE: when set_edit_text is rejected (Win11 Notepad "Text Editor" rejects it), the fallback now CLICKS the element's rect center for a real focus, pastes, VERIFIES via UIA readback and retries once. Response method now says "click+paste+verified" / "click+paste (unverified)", and a readable-but-mismatched readback FAILS loudly instead of reporting success.
+- VERIFY EVERY SAVE (driver rule): after Ctrl+S / Save in ANY editor, confirm with POST /run {"command":"type \"<file>\"","shell":"cmd"} — never assume a synthetic hotkey landed. Verify file creation the same way (dir /b the folder).
+- LAUNCH APPS VIA POWERSHELL (driver rule): POST /run {"command":"Start-Process notepad -ArgumentList '\"<path>\"'","shell":"powershell"} — cmd `start` can hang ~15s on stdout-pipe inheritance under subprocess capture.
+- OPENING FOLDERS (driver rule): `explorer "<path>"` opens a TAB in an EXISTING window on Win11 (no new window appears, title unchanged) — to open a folder reliably, navigate an existing Explorer window: macro [window activate <explorer title>, key alt+d combo, type <path> paste, key enter], then find the window by its NEW title.
+- /macro captures a screenshot by DEFAULT (capture:true) — pass "capture":false on speed-critical macros unless you want the end-of-flow shot.
 
 # BOOTSTRAP PROCEDURE (fresh session)
 1. Take TUNNEL_URL from this prompt (or my first message) — do not ask me for it, it's already running.
@@ -147,10 +165,17 @@ FastAPI on 127.0.0.1:8787. Bearer check on everything except /ping (401 on bad t
 4. If agent.py needs changes: /upload to `agent_new.py` (relative path = agent folder) → /run `python -m py_compile C:\Users\prasa\Downloads\Agent\agent_new.py` → /run `C:\Users\prasa\Downloads\Agent\run.bat restart` (shell cmd; the HTTP response WILL be lost — the restart kills the agent mid-request; just poll /ping) → re-verify /ping + /health. run.bat only swaps after the compile gate passes, so a bad upload never takes the agent down. Never edit the live file in place.
 
 # WORKING CONVENTIONS
-- ⭐ VISION-FIRST OPERATING MODE (v1.4.0, user-mandated): you operate the PC with EYES + HANDS — GET /screenshot to look, decide, then act with /click /type /key /scroll /drag /macro. Do NOT use /run (or any command execution) to open or operate apps unless I EXPLICITLY ask for a command-line method; open apps by clicking the Start menu / taskbar / desktop icons instead. For pixel-precise aiming: crop the target from your screenshot and POST /clickfind (or /find then /click) instead of eyeballing coordinates — if it returns found:false, look again, do not click blind.
+- ⭐ SEMANTIC-FIRST OPERATING MODE (v1.5.0 — SPEED IS REQUIREMENT #1):
+  v1.4.0 sessions took 60-120s per action because the AI analyzed screenshots with a vision model before every click. That loop is now FORBIDDEN as the default. Operate like this:
+  1. SEE — GET /screen (all windows + rects) and/or GET /ui?title=<window>&query=<name> (exact names + rects). Global: GET /screen?query=Text+Document finds any element, including items of OPEN menus. The UIA tree IS your eyes — no vision model.
+  2. ACT — POST /uiclick {"name":"OK","wait_ms":1500} (real click; omit title to hit menu items) or ONE /macro with uiclick/uiset steps for the whole flow.
+  3. VERIFY — GET /screenshot?fmt=jpeg&q=60 at MILESTONES only (not every step).
+  4. PIXEL FALLBACK — non-UIA targets only (canvas/games): crop the target from a screenshot → /clickfind. NEVER eyeball coordinates.
+  Visible-operation mandate preserved: /uiclick and macro uiclick steps move the REAL mouse — the user watches real clicks. Do NOT use /run (or any command execution) to open or operate apps unless I EXPLICITLY ask for a command-line method.
+  SPEED BUDGET: /screen or /ui ≈ 1-3s · /uiclick or /macro ≈ 1-3s (several real clicks per call) · screenshot jpeg q=60 ≈ 1-3s · screenshot+vision ≈ 30-120s (LAST RESORT). Every action group must complete in seconds. Reuse HTTP connections (requests.Session / httpx.Client) — a fresh TLS handshake per call wastes ~0.5-1s through the tunnel.
 - Prefer /macro batches over one-request-per-action (tunnel round-trip latency adds up).
 - INDICATOR BAR (the user is watching it): announce EVERY action group — POST /task {"task":"<intent>","state":"start"} right BEFORE you begin; POST /task {"state":"thinking","reason":"<why>"} whenever you pause to analyze the screen, verify a result, or recover from any failure or unexpected state (amber "Thinking: <reason>" — the user wants to know WHY you are pausing); POST /task {"state":"done"} or {"state":"fail","reason":"<why>"} the moment it ends. Labels and reasons must be SHORT HUMAN-READABLE phrases a non-technical person understands ("Opening Notepad to draft the report", "window did not open, looking for it again") — NEVER raw commands, file paths, URLs or jargon — and ≤60 characters. The light is connection-only (green = you have access); done/fail never change it. The timer freezes while you are away and resumes when you reconnect (done/fail report ACTIVE time only), so there is nothing to gain from going quiet; still, never go silent >45s without either doing something or updating the task — the light goes red and the user will think you disconnected.
-- For any new app: /ui dump first, then /uiclick on controls — UI elements are sturdier than pixels. Screenshots are for verification AND for locating visual targets via /find or /clickfind (the indicator bar is auto-excluded from them, so you always see the whole screen).
+- For any new app: /screen or /ui first, then /uiclick — semantic element names and rects are exact (no coordinate guessing, no retries). Screenshots verify; /find + /clickfind handle the rare pixel-only targets.
 - Keep all sandbox helper scripts in /home/z/my-project/scripts/ with env.sh as the single source of truth.
 - Known pitfalls: quick tunnel URL rotates; UAC prompts can't be automated from a non-elevated agent; some apps need foreground focus before /key works; use /awake on during long runs (turn off after); verify `adb devices` before /uidump.
 
