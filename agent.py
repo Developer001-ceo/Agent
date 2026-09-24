@@ -91,7 +91,7 @@ pyautogui.PAUSE = 0.05
 TOKEN = "Czj3u9HadjO-PkEMw9X9VR_S02v_ZXKMD9CcFT1WADs"
 HOST = "127.0.0.1"          # localhost only -- never change to 0.0.0.0
 PORT = 8787
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 AGENT_ROOT = os.path.dirname(os.path.abspath(__file__))
 JOBS_DIR = os.path.join(AGENT_ROOT, "jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
@@ -131,8 +131,13 @@ _TRACK_LOCK = threading.Lock()
 # v1.3.1 internal freeze accounting (never part of the public contract):
 #   paused_total -- seconds accumulated while the AI was disconnected
 #   frozen_at    -- wall-clock moment the current freeze began (None = live)
+# v1.4.0: "reason" -- optional plain-words note the AI attaches to a task
+# state (why it is thinking / why it failed). Rendered on the indicator bar.
 _TASK = {"label": None, "state": "idle", "started": None, "ended": None,
-         "paused_total": 0.0, "frozen_at": None}
+         "paused_total": 0.0, "frozen_at": None, "reason": None}
+
+# states where the AI is actively on the task (timer runs / freezes apply)
+_ACTIVE_STATES = ("working", "thinking")
 _TASK_LOCK = threading.Lock()
 _BAR_SECRET = secrets.token_hex(16)   # fresh every agent start; bar re-reads it
 
@@ -250,8 +255,10 @@ def _task_freeze_update(connected: bool, last_seen, now: float) -> None:
         (last completed request + idle threshold; task start if the AI
         never showed up at all)
       AI came back while frozen  -> fold the pause into paused_total so the
-        timer resumes exactly where it froze"""
-    if _TASK["state"] != "working":
+        timer resumes exactly where it froze
+    v1.4.0: "thinking" counts as an active state too -- the AI is still on
+    the task, it is just figuring out what to do next."""
+    if _TASK["state"] not in _ACTIVE_STATES:
         return
     if connected:
         if _TASK["frozen_at"] is not None:
@@ -270,7 +277,7 @@ def _task_elapsed(connected: bool, now: float):
     final duration once done/fail. None when there is nothing to measure.
     _TASK_LOCK must be held; call _task_freeze_update first."""
     started = _TASK["started"]
-    if _TASK["state"] != "working":
+    if _TASK["state"] not in _ACTIVE_STATES:
         if isinstance(started, (int, float)) and isinstance(_TASK["ended"], (int, float)):
             return max(0.0, _TASK["ended"] - started)
         return None
@@ -287,8 +294,9 @@ def _finish_task(state: str, label, now: float) -> bool:
     """Mark the current task done/fail. Assumes _TASK_LOCK is held.
     v1.3.1: the recorded duration EXCLUDES paused time -- an open freeze is
     folded into paused_total first, then ended = now - paused_total, so
-    ended - started is pure active-trying time."""
-    if _TASK["state"] == "working":
+    ended - started is pure active-trying time.
+    v1.4.0: finishing from "thinking" behaves exactly like from "working"."""
+    if _TASK["state"] in _ACTIVE_STATES:
         if label:
             _TASK["label"] = label          # finished a task it forgot to announce
         if _TASK["frozen_at"] is not None:  # still frozen -> close the pause now
@@ -297,6 +305,7 @@ def _finish_task(state: str, label, now: float) -> bool:
         _TASK["state"] = state
         _TASK["ended"] = now - _TASK["paused_total"]
         _TASK["paused_total"] = 0.0
+        _TASK["frozen_at"] = None
         return True
     if label:                               # done for a never-announced task
         _TASK["label"] = label              # duration unknown -> show 0, do not
@@ -484,7 +493,8 @@ class DownloadIn(BaseModel):
 
 class TaskIn(BaseModel):
     task: Optional[str] = None          # label; required for state=start
-    state: str = "start"                # start | done | fail | clear
+    state: str = "start"                # start | thinking | done | fail | clear
+    reason: Optional[str] = None        # v1.4.0: why thinking / why it failed
 
 
 # ------------------------------------------------------------- adb helper ----
@@ -961,6 +971,15 @@ def kill(inp: KillIn, request: Request):
     return r
 
 
+class FindIn(BaseModel):
+    image_b64: str                      # PNG/JPEG of the thing to find
+    confidence: float = 0.9             # needs opencv; falls back to exact
+    region: Optional[str] = None        # "x,y,w,h" to narrow the search
+    grayscale: bool = True
+    button: str = "left"                # /clickfind only
+    clicks: int = 1                     # /clickfind only
+
+
 @app.post("/click")
 def click(inp: ClickIn, request: Request):
     guard(request)
@@ -969,6 +988,98 @@ def click(inp: ClickIn, request: Request):
     with _input_lock:
         pyautogui.click(x=inp.x, y=inp.y, clicks=inp.clicks, button=inp.button)
     return {"ok": True}
+
+
+# ------------------------------------------------ v1.4.0: vision workflow ----
+# The default way the AI operates the PC is now EYES + HANDS: look with
+# /screenshot, decide, act with /click /type /key /macro -- never by running
+# commands. /find and /clickfind close the precision gap: the AI sees a
+# target in its screenshot, crops it, and asks the agent to locate that
+# exact patch of pixels on the live screen (template matching), getting
+# back pixel-perfect coordinates it can click.
+
+def _decode_template(image_b64: str):
+    """base64 -> PIL Image, or raises ValueError with a friendly message."""
+    try:
+        raw = base64.b64decode(image_b64, validate=True)
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        return img
+    except Exception as e:
+        raise HTTPException(status_code=400,
+                            detail="image_b64 is not a valid PNG/JPEG: %s" % e)
+
+
+def _parse_region(region: Optional[str]):
+    """'x,y,w,h' -> tuple, or raises 400."""
+    if not region:
+        return None
+    try:
+        x, y, w, h = [int(v) for v in region.split(",")]
+        if w <= 0 or h <= 0:
+            raise ValueError
+        return (x, y, w, h)
+    except Exception:
+        raise HTTPException(status_code=400, detail="region must be x,y,w,h")
+
+
+def _locate_matches(template, region, confidence: float, grayscale: bool):
+    """Template-match the template against a bar-free grab of the screen.
+    Returns a list of {'x','y','left','top','w','h'} center boxes (max 10).
+    confidence needs opencv; without it we fall back to an exact match."""
+    screen = _capture_screen()                 # bar excluded from the grab
+    if region:
+        x, y, w, h = region
+        screen = screen.crop((x, y, x + w, y + h))
+    kwargs = {"grayscale": grayscale}
+    try:
+        boxes = list(pyautogui.locateAll(template, screen, confidence=confidence, **kwargs))
+    except Exception:
+        # no opencv (or it disliked the args) -> exact matching, best effort
+        try:
+            boxes = list(pyautogui.locateAll(template, screen, **kwargs))
+        except Exception:
+            boxes = []
+    out = []
+    for b in boxes[:10]:
+        left = b.left + (region[0] if region else 0)
+        top = b.top + (region[1] if region else 0)
+        out.append({"x": left + b.width // 2, "y": top + b.height // 2,
+                    "left": left, "top": top, "w": b.width, "h": b.height})
+    return out
+
+
+@app.post("/find")
+def find(inp: FindIn, request: Request):
+    """Locate a piece of the screen by picture. Send a small crop from your
+    last /screenshot (the button/icon/field you want), get back the pixel
+    coordinates where it currently sits on screen. {} when not found."""
+    guard(request)
+    template = _decode_template(inp.image_b64)
+    region = _parse_region(inp.region)
+    matches = _locate_matches(template, region, inp.confidence, inp.grayscale)
+    return {"ok": True, "found": bool(matches), "count": len(matches),
+            "matches": matches}
+
+
+@app.post("/clickfind")
+def clickfind(inp: FindIn, request: Request):
+    """Find (see /find) then click the first match in one atomic call.
+    Use this instead of eyeballing coordinates from a screenshot."""
+    guard(request)
+    if inp.button not in ("left", "right", "middle"):
+        raise HTTPException(status_code=400, detail="button must be left|right|middle")
+    template = _decode_template(inp.image_b64)
+    region = _parse_region(inp.region)
+    matches = _locate_matches(template, region, inp.confidence, inp.grayscale)
+    if not matches:
+        return {"ok": True, "found": False, "count": 0, "matches": [],
+                "clicked": None}
+    m = matches[0]
+    with _input_lock:
+        pyautogui.click(x=m["x"], y=m["y"], clicks=inp.clicks, button=inp.button)
+    return {"ok": True, "found": True, "count": len(matches), "matches": matches,
+            "clicked": {"x": m["x"], "y": m["y"]}}
 
 
 @app.post("/drag")
@@ -1580,6 +1691,7 @@ def indicator_state(request: Request):
         elapsed = _task_elapsed(connected, now)            # active seconds
         task = {"label": _TASK["label"], "state": _TASK["state"],
                 "started": _TASK["started"], "ended": _TASK["ended"],
+                "reason": _TASK["reason"],
                 "elapsed": (round(elapsed, 1) if elapsed is not None else None)}
     return {
         "ok": True,
@@ -1600,37 +1712,65 @@ def indicator_state(request: Request):
 def task_ep(inp: TaskIn, request: Request):
     """AI announces what it is doing -- drives the indicator bar.
       {"task":"Opening Notepad to draft the report","state":"start"}
-                                            -> bar: AI is working | Opening Notepad..., timer 0
-      {"state":"done"}  or  {"state":"fail"}  -> bar: Finished/Could not finish + "took/after MM:SS"
-      {"state":"clear"}                     -> bar: idle
+                                  -> bar: Doing: Opening Notepad... + timer from 0
+      {"state":"thinking","reason":"window did not open, looking for it"}
+                                  -> bar: Thinking: <reason>, timer KEEPS RUNNING
+                                    (use whenever you pause to analyze the
+                                    screen or recover from a failure)
+      {"state":"done"} / {"state":"fail","reason":"menu item was greyed out"}
+                                  -> bar: Done/Failed (+reason), timer frozen
+      {"state":"clear"}           -> bar: idle
     Timer RESETS whenever the label changes (or a new task starts after done).
-    Labels must be SHORT HUMAN-READABLE INTENT (see Prompt.md): plain words a
-    non-technical person understands, never raw commands/paths/jargon.
-    v1.3.1: the timer FREEZES while the AI is disconnected and resumes on
-    reconnect; done/fail record ACTIVE time only (paused seconds excluded)."""
+    Labels/reasons must be SHORT HUMAN-READABLE phrases (see Prompt.md).
+    v1.3.1: timer FREEZES while the AI is disconnected, resumes on reconnect;
+    done/fail record ACTIVE time only (paused seconds excluded).
+    v1.4.0: thinking state + reason on any announcement. The red/green light
+    is pure CONNECTION state -- done/fail never change it."""
     guard(request)
     st = (inp.state or "").strip().lower()
     label = (inp.task or "").strip()[:200] or None
+    reason = (inp.reason or "").strip()[:200] or None
     now = time.time()
     with _TASK_LOCK:
         if st in ("", "start", "working"):
             if not label:
                 return {"ok": False, "error": "task label required for state=start"}
-            if _TASK["label"] != label or _TASK["state"] != "working":
+            if _TASK["label"] != label or _TASK["state"] not in _ACTIVE_STATES:
                 _TASK["started"] = now          # new task (or restart) -> timer resets
                 _TASK["paused_total"] = 0.0     # v1.3.1: fresh freeze accounting
                 _TASK["frozen_at"] = None
-                # same label while still working: NOT touched -- the task
+                # same label while still active: NOT touched -- the task
                 # continues, so an open freeze stays open and keeps counting.
             _TASK["label"] = label
             _TASK["state"] = "working"
             _TASK["ended"] = None
+            _TASK["reason"] = None              # fresh start clears old reasons
+        elif st in ("think", "thinking", "analyze", "analyzing"):
+            if _TASK["state"] in _ACTIVE_STATES and (label is None or label == _TASK["label"]):
+                # same task: timer keeps running, just flip to thinking
+                if label:
+                    _TASK["label"] = label
+            else:
+                # thinking announced with a NEW label (or nothing running):
+                # it becomes the current task, timer from zero
+                if not label:
+                    return {"ok": False,
+                            "error": "no active task; pass task=<label> with state=thinking"}
+                _TASK["label"] = label
+                _TASK["started"] = now
+                _TASK["ended"] = None
+                _TASK["paused_total"] = 0.0
+                _TASK["frozen_at"] = None
+            _TASK["state"] = "thinking"
+            _TASK["reason"] = reason
         elif st in ("done", "ok", "success"):
             if not _finish_task("done", label, now):
                 return {"ok": False, "error": "no active task (POST /task state=start first)"}
+            _TASK["reason"] = reason
         elif st in ("fail", "failed", "error"):
             if not _finish_task("fail", label, now):
                 return {"ok": False, "error": "no active task (POST /task state=start first)"}
+            _TASK["reason"] = reason
         elif st == "clear":
             _TASK["label"] = None
             _TASK["state"] = "idle"
@@ -1638,8 +1778,10 @@ def task_ep(inp: TaskIn, request: Request):
             _TASK["ended"] = None
             _TASK["paused_total"] = 0.0
             _TASK["frozen_at"] = None
+            _TASK["reason"] = None
         else:
-            return {"ok": False, "error": "state must be start|done|fail|clear"}
+            return {"ok": False,
+                    "error": "state must be start|thinking|done|fail|clear"}
         snap = dict(_TASK)
     return {"ok": True, "task": snap}
 

@@ -64,7 +64,7 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-BAR_VERSION = "1.3.1"
+BAR_VERSION = "1.4.0"
 AGENT_URL = os.environ.get("AGENT_URL", "http://127.0.0.1:8787").rstrip("/")
 SINGLETON_PORT = int(os.environ.get("INDICATOR_PORT", "8799"))
 KEY_FILE = os.path.join(HERE, "indicator.key")
@@ -96,20 +96,24 @@ GREEN_DIM = "#157f43"
 RED = "#ef4444"
 RED_TEXT = "#f87171"
 GREEN_TEXT = "#4ade80"
+THINK_TEXT = "#fbbf24"      # v1.4.0: amber for the thinking task slot
 HOVER = "#2a303c"
 
 FONT = "Segoe UI"         # falls back to the system default elsewhere
 MONO = "Consolas"
 
-# texts (v1.3.1: plain human sentences instead of ALL-CAPS jargon)
-TXT_WORKING = "AI is working"
-TXT_CONNECTED_IDLE = "AI connected — waiting for a task"
-TXT_PAUSED = "AI disconnected — task paused"
-TXT_DISCONNECTED_IDLE = "AI disconnected — waiting for AI to reconnect"
-TXT_DONE = "Finished"
-TXT_FAIL = "Could not finish"
+# texts (v1.4.0: status = PURE CONNECTION state; what the AI is doing
+# lives in the task slot, never in the light)
+TXT_CONNECTED = "AI connected — controlling your PC"
+TXT_DISCONNECTED = "AI disconnected — no access"
 TXT_OFFLINE = "Agent offline — run run.bat to bring it back"
 TXT_CONNECTING = "Connecting to agent…"
+# task-slot prefixes
+TSK_DOING = "Doing:"
+TSK_THINKING = "Thinking:"
+TSK_DONE = "Done:"
+TSK_FAILED = "Failed:"
+TSK_PAUSED = "Paused:"
 
 
 def log(msg: str) -> None:
@@ -164,24 +168,35 @@ def compute_view(payload, now: float, offset: float = 0.0, blink: bool = False,
     """Pure: /indicator payload -> what the bar shows. No tkinter involved,
     so this is unit-testable headless.
 
-    v1.3.1: the agent supplies task.elapsed (ACTIVE seconds, paused time
-    excluded). We render that directly -- while working AND connected we
-    advance it locally between the 1s polls so the chip stays smooth; every
-    other state (paused / done / fail) shows the server's frozen value.
-    `blink` is accepted for signature compatibility but the pulse phase is
-    owned by the bar (see _apply)."""
+    v1.4.0 SEMANTICS (user-specified):
+      * the LIGHT + status sentence are PURE CONNECTION STATE:
+          green  = AI connected / has access (pulsing while it is actively
+                   working or thinking)
+          red    = AI disconnected / no access
+        Task outcomes (done/failed) NEVER touch the light -- they live in
+        the task slot text only.
+      * the TASK SLOT says what the AI is doing:
+          Doing: <label>            + live timer
+          Thinking: <reason>        + live timer (amber, timer keeps running)
+          Paused: <label>           + frozen dim timer (AI went away)
+          Done: <label>   took MM:SS
+          Failed: <label> — <reason>   after MM:SS
+      * task.elapsed (v1.3.1+) is rendered directly; while working AND
+        connected we advance it locally between 1s polls so the chip stays
+        smooth. `blink` accepted for signature compatibility; the pulse
+        phase is owned by the bar (see _apply)."""
     if not isinstance(payload, dict):
         return {"color": "red", "pulse": False, "status": TXT_OFFLINE,
                 "task": None, "timer": None, "task_kind": "offline",
-                "chip_prefix": "", "dim_timer": False}
+                "chip_prefix": "", "dim_timer": False, "task_think": False}
     ai = payload.get("ai") or {}
     task = payload.get("task") or {}
     last_action = payload.get("last_action") or {}
     now_s = now + offset
 
     connected = bool(ai.get("connected"))
-    in_flight = int(ai.get("in_flight") or 0)          # noqa: F841 (kept for the snapshot hook)
     label = task.get("label")
+    reason = task.get("reason")
     tstate = task.get("state") or "idle"
     started = task.get("started")
     ended = task.get("ended")
@@ -198,51 +213,67 @@ def compute_view(payload, now: float, offset: float = 0.0, blink: bool = False,
             return now_s - started
         return None
 
-    view = {"task": None, "timer": None, "chip_prefix": "", "dim_timer": False}
+    view = {"task": None, "timer": None, "chip_prefix": "", "dim_timer": False,
+            "task_think": False}
 
-    if label and tstate == "working":
-        if connected:
-            # live: advance the server's value between polls
-            view["color"], view["pulse"] = "green", True
-            view["status"] = TXT_WORKING
+    # ---- 1. the light + status: PURE connection state ---------------------
+    if connected:
+        view["color"] = "green"
+        view["status"] = TXT_CONNECTED
+        view["pulse"] = tstate in ("working", "thinking")
+    else:
+        view["color"] = "red"
+        view["status"] = TXT_DISCONNECTED
+        view["pulse"] = False
+
+    # ---- 2. the task slot: what the AI is doing ---------------------------
+    if label and tstate in ("working", "thinking"):
+        if tstate == "thinking":
+            view["task_kind"] = "thinking"
+            view["task_think"] = True
+        else:
             view["task_kind"] = "working"
+        if connected:
+            if tstate == "thinking":
+                body = display_label(reason or label, LABEL_MAX + 14)
+                view["task"] = TSK_THINKING + " " + body
+            else:
+                view["task"] = TSK_DOING + " " + display_label(label)
+            # live: advance the server's value between polls
             if isinstance(elapsed, (int, float)) and fetched is not None:
                 base = float(elapsed) + max(0.0, now - fetched)
             else:
                 base = _elapsed_or(now_s)
         else:
             # AI went away mid-task: timer frozen at the disconnect moment
-            view["color"], view["pulse"] = "red", False
-            view["status"] = TXT_PAUSED
-            view["task_kind"] = "paused"
             view["dim_timer"] = True
+            view["task_kind"] = "paused"
+            view["task_think"] = False            # paused renders muted, not amber
+            view["task"] = TSK_PAUSED + " " + display_label(label, LABEL_MAX + 14)
             frozen = _elapsed_or((ai.get("last_seen") + AI_IDLE_RED_SECONDS)
                                  if isinstance(ai.get("last_seen"), (int, float)) else None)
             base = frozen
-        view["task"] = display_label(label)
         view["timer"] = fmt_clock(base) if base is not None else "--:--"
     elif label and tstate in ("done", "fail"):
-        if tstate == "done":
-            view["color"], view["status"] = "green", TXT_DONE
-            view["chip_prefix"] = "took "
-        else:
-            view["color"], view["status"] = "red", TXT_FAIL
-            view["chip_prefix"] = "after "
+        # outcome lives ONLY here -- the light stays whatever connection is
         view["pulse"] = False
-        view["task_kind"] = tstate
+        if tstate == "done":
+            view["task_kind"] = "done"
+            view["chip_prefix"] = "took "
+            text = TSK_DONE + " " + display_label(label, LABEL_MAX + 8)
+        else:
+            view["task_kind"] = "fail"
+            view["chip_prefix"] = "after "
+            text = TSK_FAILED + " " + display_label(label, LABEL_MAX + 8)
+            if reason:
+                text += " — " + display_label(reason, 46)
+        view["task"] = text
         fin = ended if isinstance(ended, (int, float)) else now_s
         base = _elapsed_or(fin)
-        view["task"] = display_label(label)
         view["timer"] = fmt_clock(base) if base is not None else "--:--"
     else:
-        # idle (or no label): describe the connection, not a task
+        # idle (or no label): the task slot just rests
         view["pulse"] = False
-        if connected:
-            view["color"] = "green"
-            view["status"] = TXT_CONNECTED_IDLE
-        else:
-            view["color"] = "red"
-            view["status"] = TXT_DISCONNECTED_IDLE
         what = last_action.get("what")
         if what:
             view["task"] = "Last: %s" % display_label(what)
@@ -664,25 +695,30 @@ class Bar:
     def _apply(self, view):
         key = (view["color"], view["status"], view["task"], view["timer"],
                view.get("pulse"), view.get("task_kind"), view.get("chip_prefix"),
-               view.get("dim_timer"))
+               view.get("dim_timer"), view.get("task_think"))
         if key == self._last_key:
             return
         self._last_key = key
 
-        # light
+        # light -- PURE connection state (v1.4.0); pulse = actively
+        # working/thinking while connected
         if view["color"] == "green":
             fill = GREEN if not view.get("pulse") else (GREEN if self._blink else GREEN_DIM)
         else:
             fill = RED
         self.dot.itemconfig(self._dot_id, fill=fill)
 
-        # status text
+        # status text (also connection only)
         self.status.config(text=ellipsize(view["status"], STATUS_MAX),
                            fg=GREEN_TEXT if view["color"] == "green" else RED_TEXT)
 
-        # task text + color by kind (paused = dimmed, it is not the AI's fault)
+        # task text + color by kind (the task slot carries the meaning:
+        # doing = plain, thinking = amber, done = green, failed = red,
+        # paused = dimmed -- it is not the AI's fault)
         kind = view.get("task_kind")
-        if kind == "working":
+        if view.get("task_think"):
+            fg = THINK_TEXT
+        elif kind == "working":
             fg = TEXT
         elif kind == "done":
             fg = GREEN_TEXT
@@ -690,7 +726,7 @@ class Bar:
             fg = RED_TEXT
         else:
             fg = MUTED
-        self.task.config(text=ellipsize(view["task"] or "", LABEL_MAX + 12), fg=fg)
+        self.task.config(text=ellipsize(view["task"] or "", LABEL_MAX + 22), fg=fg)
 
         # timer chip: "01:24" live / frozen, "took 01:24", "after 00:07";
         # grey it out while the task is paused (AI disconnected)
