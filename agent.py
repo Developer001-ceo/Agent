@@ -1,6 +1,41 @@
 """
-agent.py -- Remote Test Agent for Windows  (v1.2.2)
+agent.py -- Remote Test Agent for Windows  (v1.3.1)
 ====================================================
+v1.3.1 fixes (all three user-reported):
+  TIMER FREEZES WHEN THE AI DISCONNECTS
+    GET /indicator now returns task.elapsed = ACTIVE seconds on the task
+    (paused time excluded). While the AI is away the clock stops at the
+    disconnect moment; if the AI comes back the SAME task resumes where it
+    froze. POST /task done/fail record ended = now - paused_total, so the
+    final duration is active-trying time only.
+  THE BAR NEVER APPEARS IN SCREENSHOTS (the AI needs a clean view)
+    /screenshot and /macro captures first ask the bar to vacate: it
+    capture-cloaks itself on Windows 10 2004+ (SetWindowDisplayAffinity
+    WDA_EXCLUDEFROMCAPTURE -- visible on screen, absent from captures) and
+    falls back to hide -> capture -> show via the bar's control server
+    (127.0.0.1:8799 /hide /show /status). Bar trouble can NEVER fail a
+    capture; a hidden bar auto-reappears after 3s as a safety net.
+  CLEARER STATUS TEXTS
+    the bar now speaks plain human sentences ("AI is working",
+    "AI disconnected — task paused", "Finished ... took 01:24",
+    "Agent offline — run run.bat to bring it back"); stale indicator.stop
+    sentinels are deleted at bar startup so a fresh bar never insta-exits.
+
+v1.3 additions (INDICATOR BAR):
+  indicator.py   -> thin always-on-top bar at the top of the screen:
+                    [light] AI is working | Opening Notepad | 00:42  (live, 4 fps)
+                    green light while AI requests flow, red when the AI went
+                    idle > AGENT_IDLE_RED_SECONDS or the agent is down.
+  GET  /indicator -> live JSON state for the bar (auth: Bearer TOKEN or the
+                     per-boot secret in indicator.key -- never counts as AI activity)
+  POST /task      -> the AI announces what it is doing:
+                     {"task":"opening Notepad","state":"start"} then
+                     {"state":"done"} or {"state":"fail"}. The bar's task
+                     timer resets whenever the task label changes.
+  the agent spawns the bar automatically on start (Windows only); single
+  instance is enforced by the bar itself (port 8799). run.bat bar restarts it,
+  run.bat stop also closes it (indicator.stop sentinel).
+
 v1.2 additions:
   POST /uiset        -> set text on a UIA control by name (desktop forms)
   POST /clipboard    -> get/set clipboard; /type auto-pastes unicode
@@ -30,11 +65,14 @@ import io
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
+import urllib.request
 import weakref
 import xml.etree.ElementTree as ET
 from typing import List, Optional
@@ -53,7 +91,7 @@ pyautogui.PAUSE = 0.05
 TOKEN = "Czj3u9HadjO-PkEMw9X9VR_S02v_ZXKMD9CcFT1WADs"
 HOST = "127.0.0.1"          # localhost only -- never change to 0.0.0.0
 PORT = 8787
-VERSION = "1.2.2"
+VERSION = "1.3.1"
 AGENT_ROOT = os.path.dirname(os.path.abspath(__file__))
 JOBS_DIR = os.path.join(AGENT_ROOT, "jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
@@ -73,6 +111,202 @@ _PID_CACHE = {}
 _WEB = {"pw": None, "ctx": None, "console": [], "errors": []}
 _WEB_LOCK = threading.Lock()
 _WEB_HOOKED = weakref.WeakSet()
+
+
+# --------------------------------------------- v1.3: indicator bar plumbing ----
+# The indicator bar (indicator.py) is a thin always-on-top strip at the top of
+# the screen: [light] [AI CONTROLLING] [TASK: ...] [00:42].
+#   light  : GREEN while authorized AI requests are flowing (or one is
+#            executing right now), RED once the AI has been idle longer than
+#            AI_IDLE_RED_SECONDS -- or the agent itself is down.
+#   task   : what the AI announced via POST /task (fallback: last API action).
+#   timer  : seconds on the CURRENT task; resets when the label changes.
+INDICATOR_KEY_FILE = os.path.join(AGENT_ROOT, "indicator.key")    # per-boot bar secret
+INDICATOR_STOP_FILE = os.path.join(AGENT_ROOT, "indicator.stop")  # stop sentinel
+INDICATOR_PORT = int(os.environ.get("INDICATOR_PORT", "8799"))    # bar singleton port
+AI_IDLE_RED_SECONDS = float(os.environ.get("AGENT_IDLE_RED_SECONDS", "45") or 45)
+
+_TRACK = {"last_seen": None, "last_what": None, "in_flight": 0}
+_TRACK_LOCK = threading.Lock()
+# v1.3.1 internal freeze accounting (never part of the public contract):
+#   paused_total -- seconds accumulated while the AI was disconnected
+#   frozen_at    -- wall-clock moment the current freeze began (None = live)
+_TASK = {"label": None, "state": "idle", "started": None, "ended": None,
+         "paused_total": 0.0, "frozen_at": None}
+_TASK_LOCK = threading.Lock()
+_BAR_SECRET = secrets.token_hex(16)   # fresh every agent start; bar re-reads it
+
+
+def _indicator_write_key() -> None:
+    try:
+        with open(INDICATOR_KEY_FILE, "w", encoding="utf-8") as f:
+            f.write(_BAR_SECRET)
+    except OSError:
+        pass
+
+
+try:
+    if os.path.exists(INDICATOR_STOP_FILE):
+        os.remove(INDICATOR_STOP_FILE)    # a fresh agent start voids an old stop
+except OSError:
+    pass
+_indicator_write_key()
+
+
+@app.middleware("http")
+async def _ai_activity_tracker(request: Request, call_next):
+    """Counts authorized AI requests so the bar can tell connected from idle.
+    /ping and /indicator never count -- neither means the AI is controlling.
+    last_seen is stamped when a request COMPLETES, so a long /macro or /run
+    stays green afterwards instead of instantly flipping red."""
+    path = request.url.path
+    if path not in ("/ping", "/indicator"):
+        auth = request.headers.get("authorization", "")
+        if auth.startswith("Bearer ") and auth[7:] == TOKEN:
+            with _TRACK_LOCK:
+                _TRACK["in_flight"] += 1
+                _TRACK["last_what"] = "%s %s" % (request.method, path)
+            try:
+                return await call_next(request)
+            finally:
+                with _TRACK_LOCK:
+                    _TRACK["in_flight"] -= 1
+                    _TRACK["last_seen"] = time.time()
+    return await call_next(request)
+
+
+def _indicator_auth(request: Request) -> None:
+    """/indicator accepts the real Bearer TOKEN or the bar's per-boot secret
+    from indicator.key (so the local bar can poll, but a random tunnel
+    visitor who only knows the URL gets nothing)."""
+    auth = request.headers.get("authorization", "")
+    tok = auth[7:] if auth.startswith("Bearer ") else ""
+    if tok and (tok == TOKEN or tok == _BAR_SECRET):
+        return
+    raise HTTPException(status_code=401, detail="unauthorized")
+
+
+def _port_listening(port: int) -> bool:
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=0.3)
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
+# --------------------------------------- v1.3.1: bar-safe pixel captures ----
+# The bar paints itself always-on-top at the very top of the screen -- exactly
+# where the AI looks. Before ANY pixel capture we ask the bar (control server
+# on 127.0.0.1:8799, added in indicator.py v1.3.1) to get out of the way:
+# capture-cloaked bars are already invisible to captures (no-op), everything
+# else hides for the duration of the shot. Bar problems must NEVER make a
+# screenshot fail, so every error is swallowed.
+
+def _bar_call(path: str):
+    """One tiny HTTP call to the bar's control server. Returns the parsed
+    JSON dict, or None when there is no bar / it does not answer / anything
+    at all goes wrong."""
+    try:
+        req = urllib.request.Request("http://127.0.0.1:%d%s" % (INDICATOR_PORT, path),
+                                     method="POST")
+        with urllib.request.urlopen(req, timeout=0.5) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _bar_hide():
+    """Ask the bar to vacate the screen for a capture. Reply (or None):
+      {"cloaked": true}            -> nothing to do, it never shows in shots
+      {"hidden": true}             -> it is hiding; caller MUST _bar_show()
+      None / unreachable           -> no bar, capture straight away
+    """
+    return _bar_call("/hide")
+
+
+def _bar_show():
+    """Let the bar come back after _bar_hide(). Errors always ignored."""
+    return _bar_call("/show")
+
+
+def _capture_screen():
+    """pyautogui.screenshot with the indicator bar removed from the frame.
+    If the bar actually hides we give it 0.15s to withdraw first; /show is
+    sent in a finally, and a hidden bar also auto-reappears after 3s on its
+    own, so a crash between hide and show can never leave it invisible."""
+    hid = _bar_hide()
+    try:
+        if isinstance(hid, dict) and hid.get("hidden"):
+            time.sleep(0.15)          # let the withdraw actually happen
+        return pyautogui.screenshot()
+    finally:
+        _bar_show()
+
+
+def _task_freeze_update(connected: bool, last_seen, now: float) -> None:
+    """v1.3.1: advance the task FREEZE accounting. _TASK_LOCK must be held.
+      AI went away while working -> frozen_at = the moment it went away
+        (last completed request + idle threshold; task start if the AI
+        never showed up at all)
+      AI came back while frozen  -> fold the pause into paused_total so the
+        timer resumes exactly where it froze"""
+    if _TASK["state"] != "working":
+        return
+    if connected:
+        if _TASK["frozen_at"] is not None:
+            _TASK["paused_total"] += max(0.0, now - _TASK["frozen_at"])
+            _TASK["frozen_at"] = None
+    else:
+        if _TASK["frozen_at"] is None:
+            if last_seen is not None:
+                _TASK["frozen_at"] = last_seen + AI_IDLE_RED_SECONDS
+            else:
+                _TASK["frozen_at"] = _TASK["started"]
+
+
+def _task_elapsed(connected: bool, now: float):
+    """v1.3.1: ACTIVE seconds on the task (paused time excluded), or the
+    final duration once done/fail. None when there is nothing to measure.
+    _TASK_LOCK must be held; call _task_freeze_update first."""
+    started = _TASK["started"]
+    if _TASK["state"] != "working":
+        if isinstance(started, (int, float)) and isinstance(_TASK["ended"], (int, float)):
+            return max(0.0, _TASK["ended"] - started)
+        return None
+    if not isinstance(started, (int, float)):
+        return None
+    if connected:
+        return max(0.0, now - started - _TASK["paused_total"])
+    if _TASK["frozen_at"] is None:
+        return 0.0        # disconnected, not yet frozen by an /indicator poll
+    return max(0.0, _TASK["frozen_at"] - started - _TASK["paused_total"])
+
+
+def _finish_task(state: str, label, now: float) -> bool:
+    """Mark the current task done/fail. Assumes _TASK_LOCK is held.
+    v1.3.1: the recorded duration EXCLUDES paused time -- an open freeze is
+    folded into paused_total first, then ended = now - paused_total, so
+    ended - started is pure active-trying time."""
+    if _TASK["state"] == "working":
+        if label:
+            _TASK["label"] = label          # finished a task it forgot to announce
+        if _TASK["frozen_at"] is not None:  # still frozen -> close the pause now
+            _TASK["paused_total"] += max(0.0, now - _TASK["frozen_at"])
+            _TASK["frozen_at"] = None
+        _TASK["state"] = state
+        _TASK["ended"] = now - _TASK["paused_total"]
+        _TASK["paused_total"] = 0.0
+        return True
+    if label:                               # done for a never-announced task
+        _TASK["label"] = label              # duration unknown -> show 0, do not
+        _TASK["state"] = state              # inherit the previous task's timer
+        _TASK["started"] = now
+        _TASK["ended"] = now
+        _TASK["paused_total"] = 0.0
+        _TASK["frozen_at"] = None
+        return True
+    return False
 
 
 def guard(request: Request) -> None:
@@ -246,6 +480,11 @@ class UploadIn(BaseModel):
 
 class DownloadIn(BaseModel):
     path: str
+
+
+class TaskIn(BaseModel):
+    task: Optional[str] = None          # label; required for state=start
+    state: str = "start"                # start | done | fail | clear
 
 
 # ------------------------------------------------------------- adb helper ----
@@ -644,6 +883,7 @@ def health(request: Request):
         "pywinauto": importlib.util.find_spec("pywinauto") is not None,
         "playwright": importlib.util.find_spec("playwright") is not None,
         "awake": AWAKE_FLAG["on"],
+        "indicator": _port_listening(INDICATOR_PORT),
         "agent_version": VERSION,
     }
 
@@ -651,7 +891,7 @@ def health(request: Request):
 @app.get("/screenshot")
 def screenshot(request: Request, fmt: str = "jpeg", q: int = 85, region: Optional[str] = None):
     guard(request)
-    img = pyautogui.screenshot()
+    img = _capture_screen()        # bar hidden/cloaked, always restored after
     if region:
         try:
             x, y, w, h = [int(v) for v in region.split(",")]
@@ -898,7 +1138,7 @@ def macro(inp: MacroIn, request: Request):
     shot_b64 = None
     if inp.capture:
         try:
-            img = pyautogui.screenshot()
+            img = _capture_screen()   # bar hidden/cloaked, always restored after
             buf = io.BytesIO()
             img.convert("RGB").save(buf, "JPEG", quality=max(1, min(inp.screenshot_q, 95)))
             shot_b64 = base64.b64encode(buf.getvalue()).decode()
@@ -1317,12 +1557,123 @@ def web_snapshot(request: Request):
     return {"ok": True, **data}
 
 
+# =========================================================== v1.3 endpoints ====
+@app.get("/indicator")
+def indicator_state(request: Request):
+    """Live state for the indicator bar. Bar secret or TOKEN auth. Never
+    counted as AI activity (see _ai_activity_tracker), so the bar's own
+    polling can never keep the light green.
+    v1.3.1: this endpoint also advances the task FREEZE accounting -- while
+    the AI is disconnected the task timer stops (frozen_at), when it
+    reconnects the pause is folded into paused_total and the timer resumes.
+    task.elapsed is always ACTIVE time (paused seconds excluded)."""
+    _indicator_auth(request)
+    now = time.time()
+    with _TRACK_LOCK:
+        last_seen = _TRACK["last_seen"]
+        last_what = _TRACK["last_what"]
+        in_flight = _TRACK["in_flight"]
+    connected = bool(in_flight > 0 or
+                     (last_seen is not None and now - last_seen <= AI_IDLE_RED_SECONDS))
+    with _TASK_LOCK:
+        _task_freeze_update(connected, last_seen, now)     # freeze / resume
+        elapsed = _task_elapsed(connected, now)            # active seconds
+        task = {"label": _TASK["label"], "state": _TASK["state"],
+                "started": _TASK["started"], "ended": _TASK["ended"],
+                "elapsed": (round(elapsed, 1) if elapsed is not None else None)}
+    return {
+        "ok": True,
+        "now": now,
+        "agent_version": VERSION,
+        "ai": {
+            "connected": connected,
+            "in_flight": in_flight,
+            "last_seen": last_seen,
+            "idle_seconds": (round(now - last_seen, 1) if last_seen is not None else None),
+        },
+        "task": task,
+        "last_action": {"what": last_what, "ts": last_seen},
+    }
+
+
+@app.post("/task")
+def task_ep(inp: TaskIn, request: Request):
+    """AI announces what it is doing -- drives the indicator bar.
+      {"task":"Opening Notepad to draft the report","state":"start"}
+                                            -> bar: AI is working | Opening Notepad..., timer 0
+      {"state":"done"}  or  {"state":"fail"}  -> bar: Finished/Could not finish + "took/after MM:SS"
+      {"state":"clear"}                     -> bar: idle
+    Timer RESETS whenever the label changes (or a new task starts after done).
+    Labels must be SHORT HUMAN-READABLE INTENT (see Prompt.md): plain words a
+    non-technical person understands, never raw commands/paths/jargon.
+    v1.3.1: the timer FREEZES while the AI is disconnected and resumes on
+    reconnect; done/fail record ACTIVE time only (paused seconds excluded)."""
+    guard(request)
+    st = (inp.state or "").strip().lower()
+    label = (inp.task or "").strip()[:200] or None
+    now = time.time()
+    with _TASK_LOCK:
+        if st in ("", "start", "working"):
+            if not label:
+                return {"ok": False, "error": "task label required for state=start"}
+            if _TASK["label"] != label or _TASK["state"] != "working":
+                _TASK["started"] = now          # new task (or restart) -> timer resets
+                _TASK["paused_total"] = 0.0     # v1.3.1: fresh freeze accounting
+                _TASK["frozen_at"] = None
+                # same label while still working: NOT touched -- the task
+                # continues, so an open freeze stays open and keeps counting.
+            _TASK["label"] = label
+            _TASK["state"] = "working"
+            _TASK["ended"] = None
+        elif st in ("done", "ok", "success"):
+            if not _finish_task("done", label, now):
+                return {"ok": False, "error": "no active task (POST /task state=start first)"}
+        elif st in ("fail", "failed", "error"):
+            if not _finish_task("fail", label, now):
+                return {"ok": False, "error": "no active task (POST /task state=start first)"}
+        elif st == "clear":
+            _TASK["label"] = None
+            _TASK["state"] = "idle"
+            _TASK["started"] = None
+            _TASK["ended"] = None
+            _TASK["paused_total"] = 0.0
+            _TASK["frozen_at"] = None
+        else:
+            return {"ok": False, "error": "state must be start|done|fail|clear"}
+        snap = dict(_TASK)
+    return {"ok": True, "task": snap}
+
+
+def _spawn_indicator() -> None:
+    """Start the thin indicator bar (Windows only). It lives as a separate
+    detached process: it survives agent restarts, reconnects using the fresh
+    indicator.key, and a second copy exits at once (port-8799 singleton)."""
+    if os.environ.get("AGENT_NO_INDICATOR") == "1":
+        return
+    if os.name != "nt":
+        return
+    script = os.path.join(AGENT_ROOT, "indicator.py")
+    if not os.path.isfile(script):
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, script], cwd=AGENT_ROOT,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+        print(" Indicator bar     : spawned (thin strip at the top of the screen)")
+    except Exception as e:
+        print(" Indicator bar     : spawn failed (%s)" % e)
+
+
 if __name__ == "__main__":
     import uvicorn
     print("=" * 64)
     print(" win-agent v%s  on  http://%s:%d  (localhost only)" % (VERSION, HOST, PORT))
     print(" Token starts with   :  %s..." % TOKEN[:8])
     print(" Jobs log dir        :  %s" % JOBS_DIR)
+    _spawn_indicator()
     print(" KEEP THIS WINDOW OPEN. KEEP THE CLOUDFLARED WINDOW OPEN.")
     print("=" * 64)
     uvicorn.run(app, host=HOST, port=PORT, log_level="warning")

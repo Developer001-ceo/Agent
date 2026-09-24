@@ -13,6 +13,7 @@ REM    run.bat stop              kill the agent (tunnel untouched)
 REM    run.bat status            is the agent answering on 127.0.0.1:8787 ?
 REM    run.bat tunnel            open a fresh cloudflared window
 REM    run.bat chrome            restart Chrome with CDP port 9222 (for /web/* endpoints)
+REM    run.bat bar               start ONLY the thin indicator bar (top of screen)
 REM    run.bat deps              (re)install requirements.txt
 REM    run.bat watchdog-install  auto-restart agent within 1 min if it dies (scheduled task)
 REM    run.bat watchdog-remove   remove that scheduled task
@@ -35,6 +36,7 @@ if /i "%MODE%"=="stop"             goto do_stop
 if /i "%MODE%"=="status"           goto do_status
 if /i "%MODE%"=="tunnel"           goto do_tunnel
 if /i "%MODE%"=="chrome"           goto do_chrome
+if /i "%MODE%"=="bar"              goto do_bar
 if /i "%MODE%"=="deps"             goto do_deps
 if /i "%MODE%"=="watchdog-install" goto do_wd_install
 if /i "%MODE%"=="watchdog-remove"  goto do_wd_remove
@@ -42,7 +44,7 @@ if /i "%MODE%"=="watchdog-status"  goto do_wd_status
 if /i "%MODE%"=="watchdog-check"   goto do_wd_check
 if /i "%MODE%"=="log"              goto do_log
 
-echo Usage: run.bat [start^|restart^|stop^|status^|tunnel^|chrome^|deps^|watchdog-install^|watchdog-remove^|watchdog-status^|log]
+echo Usage: run.bat [start^|restart^|stop^|status^|tunnel^|chrome^|bar^|deps^|watchdog-install^|watchdog-remove^|watchdog-status^|log]
 exit /b 1
 
 REM ------------------------------------------------------------- start ----
@@ -86,7 +88,9 @@ exit /b 0
 
 :do_stop
 call :kill_port
-echo [OK] agent stopped (tunnel untouched).
+echo stop> "%~dp0indicator.stop"
+taskkill /F /FI "WINDOWTITLE eq WinAgent Indicator*" >nul 2>nul
+echo [OK] agent stopped (tunnel untouched). Indicator bar closed too.
 exit /b 0
 
 :do_status
@@ -121,6 +125,13 @@ ping -n 3 127.0.0.1 >nul
 start "" "%CHROME%" --remote-debugging-port=9222 --restore-last-session
 echo [OK] Chrome restarted with CDP on port 9222. The agent can now
 echo      drive it: /web/open /web/click /web/fill /web/eval /web/snapshot
+exit /b 0
+
+:do_bar
+call :check_python || exit /b 1
+call :start_indicator
+echo [OK] indicator bar running (thin strip at the top of the screen).
+echo      Close it with its X button, or stop everything with: run.bat stop
 exit /b 0
 
 :do_deps
@@ -234,6 +245,18 @@ if errorlevel 1 (
     start "Cloudflare Tunnel" cmd /k cloudflared tunnel --url http://127.0.0.1:8787
 ) else (
     echo [=] cloudflared is already running -- keeping it.
+)
+exit /b 0
+
+:start_indicator
+REM The agent also spawns the bar on every start; this is the manual way.
+REM A second copy exits at once (port-8799 singleton inside indicator.py).
+del "%~dp0indicator.stop" >nul 2>nul
+where pythonw >nul 2>nul
+if errorlevel 1 (
+    start "WinAgent Indicator" /min cmd /c python "%~dp0indicator.py"
+) else (
+    start "" pythonw "%~dp0indicator.py"
 )
 exit /b 0
 

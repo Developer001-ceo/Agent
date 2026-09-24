@@ -15,18 +15,19 @@ AI sandbox ──outbound HTTPS──> Cloudflare edge <──outbound tunnel─
 
 # CURRENT STATE ON MY PC (verify, don't redo)
 - Windows PC hostname WIN-36BCA2MFOGK, user prasa, screen 2560×1600, Python 3.12.0
-- Agent folder: `C:\Users\prasa\Music\Agent` — exactly FOUR files: agent.py (v1.2.2), run.bat, requirements.txt, README.md. Plus a `jobs\` data folder (job logs). All portability lives in run.bat (%~dp0).
-- run.bat is the single runner: `run.bat` starts agent+tunnel; `run.bat restart` swaps agent_new.py (compile-gated) and restarts; `run.bat chrome` restarts Chrome with CDP 9222; `run.bat watchdog-install` registers a 1-minute auto-restart task.
+- Agent folder: `C:\Users\prasa\Music\Agent` — exactly FIVE files: agent.py (v1.3.1), indicator.py, run.bat, requirements.txt, README.md. Plus data: `jobs\` (job logs) and indicator.key/indicator.log (auto-managed by the bar). All portability lives in run.bat (%~dp0).
+- run.bat is the single runner: `run.bat` starts agent+tunnel (the indicator bar spawns automatically); `run.bat restart` swaps agent_new.py (compile-gated) and restarts; `run.bat chrome` restarts Chrome with CDP 9222; `run.bat bar` restarts just the indicator bar; `run.bat stop` closes agent + bar; `run.bat watchdog-install` registers a 1-minute auto-restart task.
+- INDICATOR BAR: the user watches a thin always-on-top strip (light + status + task + timer). Green while you are connected (pulsing while a task runs), red after you've been idle > AGENT_IDLE_RED_SECONDS (default 45) or if the agent is down. The task timer FREEZES while you are disconnected and resumes if you reconnect to the same task; the bar never appears in screenshots (auto-excluded). Announce tasks with POST /task — see API spec.
 - cloudflared.exe available (PATH or agent folder)
 - adb at %LOCALAPPDATA%\Android\Sdk\platform-tools — usually NO device attached; ask me to plug in + enable USB debugging before any Android work
 - pip packages: fastapi, uvicorn, pyautogui, pillow, pywinauto, pygetwindow, playwright
 - Web testing: Chrome must be started via `run.bat chrome` (CDP port 9222) before /web/* works
 
-# AGENT API SPEC (v1.2.2 — EXACT, matches agent.py; wrong endpoint/fields = 422/404)
+# AGENT API SPEC (v1.3.1 — EXACT, matches agent.py; wrong endpoint/fields = 422/404)
 FastAPI on 127.0.0.1:8787. Bearer check on everything except /ping (401 on bad token). JSON in/out.
 - GET  /ping       → {"ok":true,"ts":...}  (no auth — connectivity check)
-- GET  /health     → {ok, host, screen{width,height}, adb, pywinauto, playwright, awake, agent_version}
-- GET  /screenshot?fmt=jpeg|png&q=85&region=x,y,w,h → RAW image bytes (NOT base64, NOT POST)
+- GET  /health     → {ok, host, screen{width,height}, adb, pywinauto, playwright, awake, indicator, agent_version}
+- GET  /screenshot?fmt=jpeg|png&q=85&region=x,y,w,h → RAW image bytes (NOT base64, NOT POST). The indicator bar is automatically excluded from the capture, so you always see the whole screen.
 - POST /click      {"x":int,"y":int,"button":"left|right|middle","clicks":1}
 - POST /move       {"x":int,"y":int,"duration":0.2}
 - POST /drag       {"x1":int,"y1":int,"x2":int,"y2":int,"duration":0.5}
@@ -62,7 +63,15 @@ FastAPI on 127.0.0.1:8787. Bearer check on everything except /ping (401 on bad t
 - POST /web/open   {"url":"https://x","new_tab":false} → drive YOUR Chrome via CDP (needs `run.bat chrome` + playwright)
 - POST /web/click  {"selector":"#id"};  POST /web/fill {"selector","text"};  POST /web/eval {"expression"}
 - GET  /web/state  → {title,url};  GET /web/console?clear= → {console:[],errors:[]};  GET /web/snapshot → {title,url,elements:[interactive],text}
-- NOTE: there is NO GET / status page and NO /exec endpoint — /run is the executor.
+----------------------------- v1.3 additions -----------------------------
+- GET  /indicator  → live state for the indicator bar: {ok, now, agent_version, ai{connected,in_flight,last_seen,idle_seconds}, task{label,state,started,ended,elapsed}, last_action{what,ts}} — auth: Bearer TOKEN **or** the per-boot secret in indicator.key (the bar reads that file); NEVER counts as AI activity
+- POST /task       {"task":"Opening Notepad to draft the report","state":"start"} → announce the current task for the bar (auth like everything else). state: start (timer resets when the label changes) | done | fail | clear. The response echoes the task snapshot. DO THIS AROUND EVERY TASK.
+- /health now also reports "indicator": true/false (is the bar process alive)
+- NOTE: there is NO GET / HTML status page and NO /exec endpoint — /run is the executor; /indicator is the JSON status feed.
+----------------------------- v1.3.1 additions -----------------------------
+- task.elapsed in /indicator = ACTIVE seconds on the task (1 decimal): it FREEZES while you are disconnected, resumes where it froze if you reconnect to the same task, and done/fail record ended = now - paused_total so the final duration EXCLUDES paused time
+- /screenshot and /macro captures automatically exclude the indicator bar: the bar capture-cloaks itself on Windows 10 2004+ (SetWindowDisplayAffinity WDA_EXCLUDEFROMCAPTURE) and otherwise hides → captures → reshows via its control server (127.0.0.1:8799 /hide /show /status); bar trouble can never fail a capture
+- the bar deletes stale indicator.stop sentinels at startup (a fresh bar no longer insta-exits after `run.bat stop` killed the previous one before it consumed the file)
 
 # BOOTSTRAP PROCEDURE (fresh session)
 1. Take TUNNEL_URL from this prompt (or my first message) — do not ask me for it, it's already running.
@@ -75,7 +84,8 @@ FastAPI on 127.0.0.1:8787. Bearer check on everything except /ping (401 on bad t
 
 # WORKING CONVENTIONS
 - Prefer /macro batches over one-request-per-action (tunnel round-trip latency adds up).
-- For any new app: /ui dump first, then /uiclick on controls. Screenshots are for verification only, not for locating elements.
+- INDICATOR BAR (the user is watching it): announce EVERY action group — POST /task {"task":"<intent>","state":"start"} right BEFORE you begin, POST /task {"state":"done"} (or "fail") the moment it ends. Labels must be SHORT HUMAN-READABLE INTENT a non-technical person understands ("Opening Notepad to draft the report", "Saving the screenshot to the report folder") — NEVER raw commands, file paths, URLs or jargon — and ≤60 characters. The timer freezes while you are away and resumes when you reconnect (done/fail report ACTIVE time only), so there is nothing to gain from going quiet; still, never go silent >45s without either doing something or updating the task — the light goes red and the user will think you disconnected.
+- For any new app: /ui dump first, then /uiclick on controls. Screenshots are for verification only, not for locating elements (the indicator bar is auto-excluded from them, so you always see the whole screen).
 - Keep all sandbox helper scripts in /home/z/my-project/scripts/ with env.sh as the single source of truth.
 - Known pitfalls: quick tunnel URL rotates; UAC prompts can't be automated from a non-elevated agent; some apps need foreground focus before /key works; use /awake on during long runs (turn off after); verify `adb devices` before /uidump.
 
