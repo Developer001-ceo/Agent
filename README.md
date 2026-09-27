@@ -7,7 +7,7 @@ ONE folder, SIX files. `run.bat` is the only file you ever need to touch.
 | file | purpose |
 |---|---|
 | `run.bat` | **THE runner.** start / restart / stop / status / tunnel / chrome / bar / watchdog / deps |
-| `agent.py` | the automation server (FastAPI on 127.0.0.1:8787, localhost only) — v1.5.1 |
+| `agent.py` | the automation server (FastAPI on 127.0.0.1:8787, localhost only) — v1.6.0 |
 | `indicator.py` | the thin **indicator bar** overlay (see below) — spawns automatically, needs only stdlib tkinter |
 | `requirements.txt` | python dependencies (installed automatically on first start) |
 | `README.md` | this file: quick start + full API spec + AI session prompt |
@@ -30,10 +30,35 @@ A THIN always-on-top strip at the top of your screen:
 - **Never in your screenshots** — the bar is excluded from screen captures so the AI always sees the whole screen: on Windows 10 2004+ it capture-cloaks itself (visible on your monitor, absent from screenshots); older systems auto hide → capture → show via the bar's little control server (127.0.0.1:8799), with a 3-second auto-reappear safety net. A bar problem can never fail a screenshot.
 - Live updates (polls the agent every second, repaints 4×/sec), draggable (click & drag vertically), closable (✕). If you closed it: `run.bat bar`.
 
+## Local vision tier (v1.6.0 — fast eyes, no rate limits)
+
+The agent can run its OWN vision model on your PC through [Ollama](https://ollama.com):
+the cloud AI asks `/vision` "where is X?", the agent takes a bar-free screenshot, downscales it (~1280px),
+asks the local model and returns **bounding boxes in full-screen pixel coordinates** — ready to click.
+~2-8s on your GPU instead of 30-120s of cloud vision, and **zero rate limits**.
+
+Setup (once, ~5 minutes):
+1. Install Ollama from https://ollama.com (leave it running in the tray).
+2. `ollama pull qwen2.5vl:7b-q8_0`  (~8.5 GB — needs the GPU; fits a 12GB+ card)
+3. That's it — the agent auto-detects it (`/health` → `"vision": {"ok": true, ...}`).
+
+Ollama binds to 127.0.0.1 only, so it adds **no new attack surface** — the tunnel never touches it.
+No rate limits, no per-image cost, and screenshots analyzed locally never leave your PC.
+
+New endpoints: `POST /vision` (ask about the screen), `POST /visionclick` (find + click in one call),
+macro step `visionclick`. Full spec in the API section below.
+
+Config (env vars before starting the agent, all optional): `OLLAMA_URL` (default http://127.0.0.1:11434),
+`VISION_MODEL` (default qwen2.5vl:7b-q8_0; any installed `qwen2.5vl` tag auto-picks when the default is missing),
+`VISION_MAX_SIZE` (1280), `VISION_TIMEOUT` (90), `VISION_NUM_CTX` (8192), `VISION_KEEP_ALIVE` (30m).
+
+The four-tier speed doctrine: **UIA tree → template match → local VLM → cloud vision (last resort).**
+
 ## Quick start (human)
 1. Double-click `run.bat` — it installs deps if needed, starts the agent (the indicator bar appears at the top of the screen), and opens the Cloudflare tunnel window.
 2. Copy the `https://xxxx.trycloudflare.com` URL from the "Cloudflare Tunnel" window and paste it to the AI in chat.
 3. Keep both windows open while testing.
+4. Optional: install Ollama + `ollama pull qwen2.5vl:7b-q8_0` for the local vision tier (see above).
 
 ## run.bat commands
 | command | what it does |
@@ -53,7 +78,7 @@ A THIN always-on-top strip at the top of your screen:
 ## Upgrading agent.py (this is what the AI does remotely)
 Upload `agent_new.py` → `python -m py_compile` gate → `run.bat restart`.
 If the compile check fails, the old agent.py keeps running — a bad upload can never take the agent down.
-(Upgrading to v1.5.1: replace agent.py, indicator.py **and** Prompt.md together — the semantic-first speed kit (/screen, /ui?query=, /uiclick without title, macro uiclick/uiset steps, gzip) ships as a set. A mismatched pair still works, it just falls back to the old behavior. Then `run.bat restart`, and `run.bat bar` if the bar did not respawn.)
+(Upgrading to v1.6.0: replace agent.py **and** Prompt.md together — the local vision tier (/vision, /visionclick, macro visionclick, /health vision) ships as a set with the new four-tier doctrine. indicator.py is unchanged since v1.5.1. Then `run.bat restart`. Install Ollama and pull the model first, or the vision tier just reports unavailable — everything else keeps working.)
 
 ---
 # MASTER PROMPT — Windows Remote Agent via Cloudflare Tunnel (paste into a new AI session)
@@ -73,18 +98,19 @@ AI sandbox ──outbound HTTPS──> Cloudflare edge <──outbound tunnel─
 
 # CURRENT STATE ON MY PC (verify, don't redo)
 - Windows PC hostname WIN-36BCA2MFOGK, user prasa, screen 2560×1600, Python 3.12.0
-- Agent folder: the folder the user deployed to — READ IT from the banner of their run.bat window (the `Jobs log dir` line, e.g. `C:\Users\prasa\Downloads\torfm5`); it changes between deployments. Exactly SIX files: agent.py (v1.5.1), indicator.py, run.bat, requirements.txt, README.md, Prompt.md. Plus data: `jobs\` (job logs) and indicator.key/indicator.log (auto-managed by the bar). All portability lives in run.bat (%~dp0).
+- Agent folder: the folder the user deployed to — READ IT from the banner of their run.bat window (the `Jobs log dir` line, e.g. `C:\Users\prasa\Downloads\torfm5`); it changes between deployments. Exactly SIX files: agent.py (v1.6.0), indicator.py, run.bat, requirements.txt, README.md, Prompt.md. Plus data: `jobs\` (job logs) and indicator.key/indicator.log (auto-managed by the bar). All portability lives in run.bat (%~dp0).
 - run.bat is the single runner: `run.bat` starts agent+tunnel (the indicator bar spawns automatically); `run.bat restart` swaps agent_new.py (compile-gated) and restarts; `run.bat chrome` restarts Chrome with CDP 9222; `run.bat bar` restarts just the indicator bar; `run.bat stop` closes agent + bar; `run.bat watchdog-install` registers a 1-minute auto-restart task.
 - INDICATOR BAR (v1.5.0): the user watches a thin always-on-top strip. The LIGHT + status sentence are PURE CONNECTION STATE — green = you are connected and have access (pulsing while you are actively working or thinking), red = you are disconnected/idle > AGENT_IDLE_RED_SECONDS (default 45) or the agent is down. Task outcomes NEVER change the light. The task slot says what you are doing: "Doing: <task>" (live timer), "Thinking: <reason>" (amber, timer keeps running), "Done: <task> — took MM:SS", "Failed: <task> — <reason> — after MM:SS", "Paused: <task>" (frozen dim timer while you are away). The timer FREEZES while you are disconnected and resumes if you reconnect to the same task; the bar never appears in screenshots (auto-excluded). Announce with POST /task — see API spec.
 - cloudflared.exe available (PATH or agent folder)
 - adb at %LOCALAPPDATA%\Android\Sdk\platform-tools — usually NO device attached; ask me to plug in + enable USB debugging before any Android work
 - pip packages: fastapi, uvicorn, pyautogui, pillow, pywinauto, pygetwindow, playwright
+- LOCAL VISION TIER (v1.6.0): Ollama runs on the PC (127.0.0.1:11434, localhost only) with a small VLM (default qwen2.5vl:7b) — the agent's own fast eyes for /vision and /visionclick, ~2-8s per look, no rate limits. Check the "vision" block in /health at bootstrap; if it says ok:false, tell me one sentence ("start the Ollama app on your PC") and keep going without the tier.
 - Web testing: Chrome must be started via `run.bat chrome` (CDP port 9222) before /web/* works
 
-# AGENT API SPEC (v1.5.1 — EXACT, matches agent.py; wrong endpoint/fields = 422/404)
+# AGENT API SPEC (v1.6.0 — EXACT, matches agent.py; wrong endpoint/fields = 422/404)
 FastAPI on 127.0.0.1:8787. Bearer check on everything except /ping (401 on bad token). JSON in/out.
 - GET  /ping       → {"ok":true,"ts":...}  (no auth — connectivity check)
-- GET  /health     → {ok, host, screen{width,height}, adb, pywinauto, playwright, awake, indicator, agent_version}
+- GET  /health     → {ok, host, screen{width,height}, adb, pywinauto, playwright, awake, indicator, vision{ok,url,model,installed}, agent_version}
 - GET  /screenshot?fmt=jpeg|png&q=85&region=x,y,w,h → RAW image bytes (NOT base64, NOT POST). The indicator bar is automatically excluded from the capture, so you always see the whole screen.
 - POST /click      {"x":int,"y":int,"button":"left|right|middle","clicks":1}
 - POST /move       {"x":int,"y":int,"duration":0.2}
@@ -105,6 +131,7 @@ FastAPI on 127.0.0.1:8787. Bearer check on everything except /ping (401 on bad t
                   type{text,interval} key{keys,combo} sleep{ms ≤10000} window{title,op}
                   run{command,shell,timeout ≤25} adb{args,timeout}
                   uiclick{name,title?,control_type?,index,button,double,wait_ms} uiset{name,title?,value,index,wait_ms}  (v1.5.0)
+                  visionclick{prompt,region?,max_size?,model?,timeout?≤25,index?,button?,clicks?}  (v1.6.0 — local VLM)
     → {ok,elapsed,results:[{i,action,ok,detail|error}],screenshot:<b64 jpeg|null>} (whole macro capped 30s)
 - POST /upload     {"path":"agent_new.py","data":"<base64>","append":false} — sandboxed to the agent folder; chunk by appending (chunk the BINARY before encoding)
 - POST /download   {"path":"results.json"} → {ok,path,bytes,data:"<base64>"} (≤80MB)
@@ -155,24 +182,34 @@ FastAPI on 127.0.0.1:8787. Bearer check on everything except /ping (401 on bad t
 - OPENING FOLDERS (driver rule): `explorer "<path>"` opens a TAB in an EXISTING window on Win11 (no new window appears, title unchanged) — to open a folder reliably, navigate an existing Explorer window: macro [window activate <explorer title>, key alt+d combo, type <path> paste, key enter], then find the window by its NEW title.
 - /macro captures a screenshot by DEFAULT (capture:true) — pass "capture":false on speed-critical macros unless you want the end-of-flow shot.
 
+----------------------------- v1.6.0 additions (LOCAL vision tier — Ollama) -----------------------------
+- PREREQ (check /health "vision" at bootstrap): Ollama on 127.0.0.1:11434 with a vision model pulled (default qwen2.5vl:7b; any installed qwen2.5vl tag auto-picks). vision.ok=false → one sentence to the user ("start the Ollama app on your PC") and keep going; everything else works without the tier.
+- POST /vision      {"prompt":"where is the Download button?","region":null,"max_size":1280,"model":null,"timeout":90,"detail":false} → {ok,model,elapsed,image{sent,captured,region},desc,count,boxes:[{label,x,y,left,top,w,h}],tokens?,raw?} — asks the LOCAL VLM about a fresh bar-free screenshot. boxes are FULL-screen pixel coordinates in the SAME shape /find returns: click them directly — no scaling, no guessing (the agent downscales for inference and maps coordinates back). detail:true (or an empty result) adds "raw" — the model's actual text; read it before retrying differently. The FIRST call after a restart is slow (weights load, 10-30s); keep_alive keeps it warm afterwards.
+- POST /visionclick — /vision + click boxes[index] in ONE atomic call (adds button,clicks,index). Same contract as /clickfind: found:false + clicked:null when the model saw nothing — NEVER click blindly after that. Example: {"prompt":"the address bar of the browser window","button":"left"}.
+- /macro "visionclick" step — {"prompt":"...",region?,max_size?,model?,timeout?≤25,index?,button?,clicks?} — local-VLM guided click inside a whole-flow macro.
+- GET /health → new "vision" block: {ok,url,model,installed:[...]}.
+- Config on the PC (env vars, all optional): OLLAMA_URL, VISION_MODEL, VISION_MAX_SIZE (1280), VISION_TIMEOUT (90), VISION_NUM_CTX (8192), VISION_KEEP_ALIVE (30m). Ollama is localhost-only — zero new tunnel attack surface.
+- SPEED DOCTRINE is now FOUR tiers: 1) UIA semantic tree (/screen,/ui,/uiclick) 2) template match (/find,/clickfind) 3) LOCAL VLM (/vision,/visionclick) 4) cloud vision on screenshots — LAST resort.
+
 # BOOTSTRAP PROCEDURE (fresh session)
 1. Take TUNNEL_URL from this prompt (or my first message) — do not ask me for it, it's already running.
 2. Save it ONCE in `/home/z/my-project/scripts/env.sh` together with the token (`export TUNNEL_URL=...; export TOKEN=...`) — all later scripts source this file so a URL change is a one-line edit.
 3. Verify in this exact order before any automation:
    a. curl /ping (expect {"ok":true}; DNS failure ⇒ tell me to restart the tunnel, one sentence)
-   b. /health
+   b. /health — READ the "vision" block: ok:true means the local VLM tier is ready; ok:false means tell me one sentence ("start the Ollama app on your PC") and continue without it
    c. /screenshot (confirm it's really my desktop)
 4. If agent.py needs changes: /upload to `agent_new.py` (relative path = agent folder) → /run `python -m py_compile C:\Users\prasa\Downloads\Agent\agent_new.py` → /run `C:\Users\prasa\Downloads\Agent\run.bat restart` (shell cmd; the HTTP response WILL be lost — the restart kills the agent mid-request; just poll /ping) → re-verify /ping + /health. run.bat only swaps after the compile gate passes, so a bad upload never takes the agent down. Never edit the live file in place.
 
 # WORKING CONVENTIONS
-- ⭐ SEMANTIC-FIRST OPERATING MODE (v1.5.0 — SPEED IS REQUIREMENT #1):
+- ⭐ SEMANTIC-FIRST OPERATING MODE (v1.6.0 — SPEED IS REQUIREMENT #1):
   v1.4.0 sessions took 60-120s per action because the AI analyzed screenshots with a vision model before every click. That loop is now FORBIDDEN as the default. Operate like this:
   1. SEE — GET /screen (all windows + rects) and/or GET /ui?title=<window>&query=<name> (exact names + rects). Global: GET /screen?query=Text+Document finds any element, including items of OPEN menus. The UIA tree IS your eyes — no vision model.
   2. ACT — POST /uiclick {"name":"OK","wait_ms":1500} (real click; omit title to hit menu items) or ONE /macro with uiclick/uiset steps for the whole flow.
   3. VERIFY — GET /screenshot?fmt=jpeg&q=60 at MILESTONES only (not every step).
-  4. PIXEL FALLBACK — non-UIA targets only (canvas/games): crop the target from a screenshot → /clickfind. NEVER eyeball coordinates.
+  4. PIXEL/LOCAL-VISION FALLBACK — non-UIA targets only (canvas/games/pixel-art icons): crop the target from a screenshot → /clickfind (template match); when you cannot crop a clean template, POST /visionclick {"prompt":"the red Play button"} — the LOCAL VLM on the PC finds it and clicks it (~2-8s, no rate limits). NEVER eyeball coordinates.
+  5. CLOUD VISION — your own image analysis of /screenshot output is the ABSOLUTE last resort (30-120s + rate limits); /vision already covers almost everything it did.
   Visible-operation mandate preserved: /uiclick and macro uiclick steps move the REAL mouse — the user watches real clicks. Do NOT use /run (or any command execution) to open or operate apps unless I EXPLICITLY ask for a command-line method.
-  SPEED BUDGET: /screen or /ui ≈ 1-3s · /uiclick or /macro ≈ 1-3s (several real clicks per call) · screenshot jpeg q=60 ≈ 1-3s · screenshot+vision ≈ 30-120s (LAST RESORT). Every action group must complete in seconds. Reuse HTTP connections (requests.Session / httpx.Client) — a fresh TLS handshake per call wastes ~0.5-1s through the tunnel.
+  SPEED BUDGET: /screen or /ui ≈ 1-3s · /uiclick or /macro ≈ 1-3s (several real clicks per call) · /vision or /visionclick ≈ 2-8s local VLM, no rate limits (first call after a restart ≈ 10-30s while weights load) · screenshot jpeg q=60 ≈ 1-3s · cloud screenshot+vision ≈ 30-120s (LAST RESORT). Every action group must complete in seconds. Reuse HTTP connections (requests.Session / httpx.Client) — a fresh TLS handshake per call wastes ~0.5-1s through the tunnel.
 - Prefer /macro batches over one-request-per-action (tunnel round-trip latency adds up).
 - INDICATOR BAR (the user is watching it): announce EVERY action group — POST /task {"task":"<intent>","state":"start"} right BEFORE you begin; POST /task {"state":"thinking","reason":"<why>"} whenever you pause to analyze the screen, verify a result, or recover from any failure or unexpected state (amber "Thinking: <reason>" — the user wants to know WHY you are pausing); POST /task {"state":"done"} or {"state":"fail","reason":"<why>"} the moment it ends. Labels and reasons must be SHORT HUMAN-READABLE phrases a non-technical person understands ("Opening Notepad to draft the report", "window did not open, looking for it again") — NEVER raw commands, file paths, URLs or jargon — and ≤60 characters. The light is connection-only (green = you have access); done/fail never change it. The timer freezes while you are away and resumes when you reconnect (done/fail report ACTIVE time only), so there is nothing to gain from going quiet; still, never go silent >45s without either doing something or updating the task — the light goes red and the user will think you disconnected.
 - For any new app: /screen or /ui first, then /uiclick — semantic element names and rects are exact (no coordinate guessing, no retries). Screenshots verify; /find + /clickfind handle the rare pixel-only targets.
