@@ -1,6 +1,22 @@
 """
-agent.py -- Remote Test Agent for Windows  (v1.5.0)
+agent.py -- Remote Test Agent for Windows  (v1.5.2)
 ====================================================
+v1.5.2 VISION-COST CONTROL (screenshot analysis is the #1 time sink):
+  The #1 slowdown reported in live sessions is still the AI analyzing
+  full-size screenshots through a vision model. This release makes the
+  cheap path cheaper and the expensive path disciplined:
+  GET  /screenshot  new "scale" param (0.1-1.0, LANCZOS downscale BEFORE
+                     encoding) + default quality 85 -> 60. A 2560x1600
+                     screen at scale=0.5 & q=60 is ~3-6x smaller: faster
+                     through the tunnel, cheaper to analyze. Response
+                     headers X-Screen-W / X-Screen-H / X-Screen-Scale give
+                     the ACTUAL image size (map coords back by 1/scale if
+                     you must -- or use /find, which matches FULL-screen).
+  POST /macro        new "screenshot_scale" param (default 1.0); default
+                     screenshot_q 80 -> 60 for the end-of-flow capture.
+  The doctrine (enforced by Prompt.md v1.5.2): plan and act semantically
+  (/screen, /ui, /uiclick, /macro); screenshots only VERIFY milestones.
+
 v1.5.0 SPEED REDESIGN ("semantic-first" control -- 10-20x faster, fewer errors):
   ROOT CAUSE of the 1-2 minute pauses in v1.4.0 sessions: the AI looked at
   the screen with screenshots + external vision-model analysis before every
@@ -119,7 +135,7 @@ pyautogui.PAUSE = 0.05
 TOKEN = "Czj3u9HadjO-PkEMw9X9VR_S02v_ZXKMD9CcFT1WADs"
 HOST = "127.0.0.1"          # localhost only -- never change to 0.0.0.0
 PORT = 8787
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 AGENT_ROOT = os.path.dirname(os.path.abspath(__file__))
 JOBS_DIR = os.path.join(AGENT_ROOT, "jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
@@ -513,7 +529,8 @@ class MacroIn(BaseModel):
     steps: List[dict]
     stop_on_error: bool = True
     capture: bool = True
-    screenshot_q: int = 80
+    screenshot_q: int = 60          # v1.5.2: 80 -> 60 (verification quality)
+    screenshot_scale: float = 1.0   # v1.5.2: <1.0 downscales the capture
 
 
 class UploadIn(BaseModel):
@@ -1100,7 +1117,8 @@ def health(request: Request):
 
 
 @app.get("/screenshot")
-def screenshot(request: Request, fmt: str = "jpeg", q: int = 85, region: Optional[str] = None):
+def screenshot(request: Request, fmt: str = "jpeg", q: int = 60, region: Optional[str] = None,
+               scale: float = 1.0):
     guard(request)
     img = _capture_screen()        # bar hidden/cloaked, always restored after
     if region:
@@ -1109,6 +1127,14 @@ def screenshot(request: Request, fmt: str = "jpeg", q: int = 85, region: Optiona
             img = img.crop((x, y, x + w, y + h))
         except Exception:
             raise HTTPException(status_code=400, detail="region must be x,y,w,h")
+    # v1.5.2: downscale BEFORE encoding -- scale=0.5 & q=60 is the standard
+    # verification shot: 3-6x smaller through the tunnel and much cheaper
+    # to analyze on the rare occasion a vision check is genuinely needed.
+    scale = max(0.1, min(float(scale or 1.0), 1.0))
+    if scale < 1.0:
+        resample = getattr(Image, "Resampling", Image).LANCZOS
+        img = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))),
+                         resample)
     buf = io.BytesIO()
     if fmt == "png":
         img.save(buf, "PNG")
@@ -1116,7 +1142,13 @@ def screenshot(request: Request, fmt: str = "jpeg", q: int = 85, region: Optiona
     else:
         img.convert("RGB").save(buf, "JPEG", quality=max(1, min(q, 95)))
         media = "image/jpeg"
-    return Response(content=buf.getvalue(), media_type=media)
+    # v1.5.2: tell the caller the ACTUAL pixel size of the returned image
+    # (coords seen in a scaled shot must be multiplied by 1/scale to map
+    # back to the real screen -- or just use /find, which matches the
+    # FULL-resolution screen and returns exact centers).
+    return Response(content=buf.getvalue(), media_type=media,
+                    headers={"X-Screen-W": str(img.width), "X-Screen-H": str(img.height),
+                             "X-Screen-Scale": "%.3f" % scale})
 
 
 @app.get("/windows")
@@ -1521,6 +1553,12 @@ def macro(inp: MacroIn, request: Request):
     if inp.capture:
         try:
             img = _capture_screen()   # bar hidden/cloaked, always restored after
+            # v1.5.2: optional downscale of the end-of-flow capture
+            if inp.screenshot_scale and inp.screenshot_scale < 1.0:
+                sc = max(0.1, min(float(inp.screenshot_scale), 1.0))
+                resample = getattr(Image, "Resampling", Image).LANCZOS
+                img = img.resize((max(1, int(img.width * sc)), max(1, int(img.height * sc))),
+                                 resample)
             buf = io.BytesIO()
             img.convert("RGB").save(buf, "JPEG", quality=max(1, min(inp.screenshot_q, 95)))
             shot_b64 = base64.b64encode(buf.getvalue()).decode()
