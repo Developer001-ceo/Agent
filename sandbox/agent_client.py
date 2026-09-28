@@ -1,9 +1,9 @@
 """
-agent_client.py -- semantic-first client for the Win Agent  (v1.5.2, AI-side)
+agent_client.py -- semantic-first client for the Win Agent  (v1.5.3, AI-side)
 =============================================================================
 OPTIONAL helper for the AI sandbox (NOT part of the six Windows agent files).
 
-Why it exists (the v1.5.2 speed doctrine, machine-enforced):
+Why it exists (the v1.5.x speed doctrine, machine-enforced):
   * ONE persistent HTTP session for the whole chat session -- no TLS
     re-handshake per call (~0.5-1s saved on every request through the
     Cloudflare tunnel), gzip handled automatically.
@@ -11,11 +11,15 @@ Why it exists (the v1.5.2 speed doctrine, machine-enforced):
     fast thing:
 
         SEE (screen / ui)  ->  PLAN (names + rects)  ->
-        ACT (one macro)    ->  VERIFY (scaled jpeg, milestones only)
+        ACT+SEE (one macro with screen_after)  ->
+        VERIFY (semantic first; vdescribe for content)
 
   * Screenshots are for VERIFYING, never for planning (see the VISION BAN
     in Prompt.md). verify() defaults to q=60 & scale=0.5 -- the standard
     cheap verification shot (~3-6x smaller than a full-quality grab).
+    verify_semantic() is even cheaper: /screen?query= answers "did element
+    X appear?" with NO pixels at all. vdescribe() lets the LOCAL Ollama
+    vision model read the screen -- pixels never cross the tunnel.
 
 Usage:
     export TUNNEL_URL=https://xxxx.trycloudflare.com
@@ -34,6 +38,14 @@ Usage:
         {"action": "uiset",  "name": "Filename", "value": "x.txt"},
         {"action": "key",    "keys": ["ctrl", "s"], "combo": True},
     ])
+    a.macro([                            # v1.5.3: launch flow, no fixed sleeps
+        {"action": "run", "shell": "cmd", "command": "start notepad"},
+        {"action": "waitfor", "title": "Notepad"},
+        {"action": "type", "text": "hi", "paste": True},
+    ], screen_after=True)                # window list comes back in the reply
+    a.macro(steps, screen_query="Save")  # ...or query-mode verify matches
+    a.verify_semantic("Text Document")   # v1.5.3: verify with ZERO pixels
+    a.vdescribe("What text is in the Notepad window?")  # local vision LLM
     a.verify("shot.jpg")                 # milestone screenshot (q=60, scale=0.5)
     a.find("crop.png")                   # pixel fallback (non-UIA targets only)
     a.clickfind("crop.png")              # find + click, atomic
@@ -163,13 +175,46 @@ class Agent:
         return self._post("/uiset", body)
 
     def macro(self, steps, capture=False, screenshot_q=60,
-              screenshot_scale=0.5, stop_on_error=True):
-        """ONE call for a whole flow (uiclick/uiset/type/key/... steps).
-        capture=True attaches a cheap end-of-flow verification shot."""
-        return self._post("/macro", {
-            "steps": steps, "stop_on_error": stop_on_error,
-            "capture": capture, "screenshot_q": screenshot_q,
-            "screenshot_scale": screenshot_scale})
+              screenshot_scale=0.5, stop_on_error=True,
+              screen_after=False, screen_query=""):
+        """ONE call for a whole flow (uiclick/uiset/type/key/waitfor/...).
+        capture=True attaches a cheap end-of-flow verification shot.
+        v1.5.3: screen_after=True attaches a fresh window overview to the
+        response (ACT + re-SEE in one round trip); screen_query="X"
+        attaches /screen query matches for X instead (ACT + semantic
+        VERIFY in one round trip). waitfor steps replace fixed sleeps."""
+        body = {"steps": steps, "stop_on_error": stop_on_error,
+                "capture": capture, "screenshot_q": screenshot_q,
+                "screenshot_scale": screenshot_scale}
+        if screen_after:
+            body["screen_after"] = True
+        if screen_query:
+            body["screen_query"] = screen_query
+        return self._post("/macro", body)
+
+    def verify_semantic(self, query):
+        """v1.5.3: VERIFY with zero pixels -- does element `query` exist
+        anywhere right now? Returns the /screen query dict (window +
+        matches + exact rects). The DEFAULT verification method; only fall
+        back to vdescribe() (content reads) or verify() (human-eye
+        artifact) when the tree cannot answer."""
+        return self.screen(query=query)
+
+    def vdescribe(self, prompt, model=None, q=60, scale=0.5, region=None,
+                  max_tokens=400, timeout=45):
+        """v1.5.3: the LOCAL vision LLM (Ollama on the user's GPU) reads the
+        screen and answers in TEXT -- pixels never cross the tunnel.
+        Use for rendered content the UIA tree does not expose (canvas,
+        images, PDF text). model=None -> server auto-picks (OLLAMA_VLM
+        env, else first installed vision model, else qwen2.5vl:3b).
+        Check a.health()['vlm'] first to see what is installed."""
+        body = {"prompt": prompt, "q": q, "scale": scale,
+                "max_tokens": max_tokens, "timeout": timeout}
+        if model:
+            body["model"] = model
+        if region:
+            body["region"] = region
+        return self._post("/vdescribe", body)
 
     def verify(self, path="verify.jpg", q=60, scale=0.5, region=None):
         """MILESTONE verification shot -- small by default (q=60, scale=0.5).
@@ -181,8 +226,14 @@ class Agent:
         data, headers = self._get("/screenshot", params, raw=True)
         with open(path, "wb") as f:
             f.write(data)
-        w = int(headers.get("X-Screen-W", 0) or 0)
-        h = int(headers.get("X-Screen-H", 0) or 0)
+
+        def _hdr(name):   # HTTP/2 tunnels lowercase header names
+            for k, v in headers.items():
+                if k.lower() == name.lower():
+                    return v
+            return 0
+        w = int(_hdr("X-Screen-W") or 0)
+        h = int(_hdr("X-Screen-H") or 0)
         return path, w, h
 
     # ------------------------------------------- pixel fallback (non-UIA) ----

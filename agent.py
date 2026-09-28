@@ -1,6 +1,42 @@
 """
-agent.py -- Remote Test Agent for Windows  (v1.5.2)
+agent.py -- Remote Test Agent for Windows  (v1.5.3)
 ====================================================
+v1.5.3 THE TURBO LOOP (one round trip per iteration, local vision):
+  The v1.5.2 demo showed where the remaining seconds hide: conservative
+  fixed sleeps while waiting for apps to appear, a second round trip to
+  re-SEE after acting, and remote vision calls for content reads. Fix:
+  MACRO STEP
+    "waitfor"       -> {"action":"waitfor","title":"Notepad"} or
+                        {"action":"waitfor","name":"File name"} blocks
+                        SERVER-SIDE, polling every 150ms (window titles via
+                        pygetwindow) / 300ms (UIA element names), and the
+                        macro resumes the INSTANT the target shows up
+                        (timeout_ms default 5000, cap 15000). Fixed sleep
+                        steps are dead: app-launch waits become actual
+                        ~800-1200ms instead of a guessed 3000ms.
+  POST /macro
+    screen_after     -> true: the macro RESPONSE carries a fresh window
+                        overview (title+rect+pid/exe) -- ACT and re-SEE in
+                        ONE round trip.
+    screen_query     -> "Text Document": response carries /screen query
+                        matches instead (exact rects right after the flow)
+                        -- ACT + semantic VERIFY in ONE round trip.
+  POST /vdescribe    -> the LOCAL vision LLM (Ollama) reads the screen and
+                        answers in TEXT. Capture + LANCZOS scale + JPEG q
+                        all happen ON the PC; only the answer text crosses
+                        the tunnel (pixels never leave). RTX-class GPU:
+                        ~0.3-1s total vs ~3-5s for a remote vision call.
+                        Model: "model" field or OLLAMA_VLM env, auto-pick
+                        falls back to qwen2.5vl:3b. Pull once:
+                        ollama pull qwen2.5vl:3b   (or qwen2.5vl:7b).
+  GET  /health       -> now reports "ollama": bool and "vlm":
+                        {"default", "installed":[...]} so the AI knows
+                        before the first /vdescribe.
+  VERIFY DOCTRINE: verify STRUCTURE semantically first (/macro
+  screen_query, /screen?query=, /ui). /vdescribe only to READ rendered
+  content the tree does not expose (canvas, images, PDF text). 
+  /screenshot only when a human-eye artifact is genuinely required.
+
 v1.5.2 VISION-COST CONTROL (screenshot analysis is the #1 time sink):
   The #1 slowdown reported in live sessions is still the AI analyzing
   full-size screenshots through a vision model. This release makes the
@@ -135,7 +171,7 @@ pyautogui.PAUSE = 0.05
 TOKEN = "Czj3u9HadjO-PkEMw9X9VR_S02v_ZXKMD9CcFT1WADs"
 HOST = "127.0.0.1"          # localhost only -- never change to 0.0.0.0
 PORT = 8787
-VERSION = "1.5.2"
+VERSION = "1.5.3"
 AGENT_ROOT = os.path.dirname(os.path.abspath(__file__))
 JOBS_DIR = os.path.join(AGENT_ROOT, "jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
@@ -143,6 +179,9 @@ os.makedirs(JOBS_DIR, exist_ok=True)
 MACRO_TIME_CAP = 30.0       # seconds per /macro call (tunnel friendly)
 MACRO_SLEEP_CAP = 10.0      # max seconds per sleep step
 MACRO_RUN_CAP = 25          # max timeout per run step inside a macro
+MACRO_WAITFOR_CAP_MS = 15000  # v1.5.3: max wait per waitfor step
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+OLLAMA_VLM = os.environ.get("OLLAMA_VLM", "")  # v1.5.3: force a vision model
 
 app = FastAPI(title="win-agent", docs_url=None, redoc_url=None, openapi_url=None)
 # v1.5.0: compress JSON responses (5-10x smaller through the tunnel: /ui,
@@ -531,6 +570,19 @@ class MacroIn(BaseModel):
     capture: bool = True
     screenshot_q: int = 60          # v1.5.2: 80 -> 60 (verification quality)
     screenshot_scale: float = 1.0   # v1.5.2: <1.0 downscales the capture
+    screen_after: bool = False      # v1.5.3: window overview in the response
+    screen_query: str = ""         # v1.5.3: query-mode matches in the response
+
+
+class VDescribeIn(BaseModel):
+    """v1.5.3: LOCAL vision LLM (Ollama) reads the screen, answers in text."""
+    prompt: str = "Describe the screen briefly. Be concise."
+    model: str = ""               # "" -> OLLAMA_VLM env > installed vlm > qwen2.5vl:3b
+    q: int = 60
+    scale: float = 0.5
+    region: Optional[str] = None   # x,y,w,h -- read just that part
+    max_tokens: int = 400
+    timeout: int = 45
 
 
 class UploadIn(BaseModel):
@@ -1015,6 +1067,36 @@ def _s_window(s):
     return {"title": w.title}
 
 
+def _s_waitfor(s):
+    """v1.5.3: block server-side until a window title (pygetwindow, fast)
+    or a UIA element name appears, then return the instant it does.
+    Replaces conservative fixed sleeps -- the macro resumes the moment
+    the app is actually there. Raises on timeout so stop_on_error sees
+    a failed launch cleanly."""
+    title = s.get("title")
+    name = s.get("name")
+    if not title and not name:
+        raise RuntimeError("waitfor: needs title= and/or name=")
+    timeout_ms = min(int(s.get("timeout_ms", 5000)), MACRO_WAITFOR_CAP_MS)
+    poll_ms = max(50, int(s.get("poll_ms", 150 if title else 300)))
+    t0 = time.time()
+    while (time.time() - t0) * 1000 < timeout_ms:
+        if title:
+            import pygetwindow as gw
+            if any(title.lower() in (w.title or "").lower()
+                   for w in gw.getAllWindows()):
+                return {"waited_ms": round((time.time() - t0) * 1000),
+                        "found": "title:%s" % title}
+        if name:
+            _, matches = _uia_find_any(name, None, 0)
+            if matches:
+                return {"waited_ms": round((time.time() - t0) * 1000),
+                        "found": "name:%s" % name}
+        time.sleep(poll_ms / 1000.0)
+    raise RuntimeError("waitfor: timed out after %dms waiting for %s"
+                       % (timeout_ms, title or name))
+
+
 def _s_run(s):
     shell = s.get("shell", "powershell")
     cmd = s["command"]
@@ -1089,6 +1171,7 @@ MACRO_ACTIONS = {
     "type": _s_type, "key": _s_key, "sleep": _s_sleep, "window": _s_window,
     "run": _s_run, "adb": _s_adb,
     "uiclick": _s_uiclick, "uiset": _s_uiset,      # v1.5.0 semantic steps
+    "waitfor": _s_waitfor,                         # v1.5.3: event-driven waits
 }
 
 
@@ -1112,6 +1195,10 @@ def health(request: Request):
         "playwright": importlib.util.find_spec("playwright") is not None,
         "awake": AWAKE_FLAG["on"],
         "indicator": _port_listening(INDICATOR_PORT),
+        "ollama": bool(_ollama_models()),                    # v1.5.3
+        "vlm": {"default": _ollama_pick_vlm(),              # v1.5.3
+                "installed": [m for m in _ollama_models()
+                              if any(h in m.lower() for h in _VLM_HINTS)]},
         "agent_version": VERSION,
     }
 
@@ -1426,31 +1513,27 @@ def ui_tree(request: Request, title: str, max_depth: int = 10, max_nodes: int = 
             "truncated": truncated, "elements": nodes}
 
 
-@app.get("/screen")
-def screen(request: Request, query: str = "", elements: bool = True,
-           depth: int = 3, per_window: int = 30):
-    """v1.5.0: the semantic screen -- ONE call instead of screenshot + vision
-    analysis. Overview mode (no query): every top-level window + rect (+ a
-    shallow element list each). Query mode: /screen?query=Text+Document
-    finds that element in ANY window (open context menus / submenus included
-    -- they have no title) and returns exact rects; first matching window
-    wins. This is the fast way to answer where-is-X-on-screen-right-now
-    without any screenshot."""
-    guard(request)
-    if (query or "").strip():
-        for w in _uia_desktop().windows():
+def _screen_query_impl(query):
+    """v1.5.3: /screen query mode, shared by the endpoint and /macro
+    screen_query (ACT + semantic VERIFY in one round trip)."""
+    for w in _uia_desktop().windows():
+        try:
+            matches = _uia_match(w, query, None, max_depth=10, max_nodes=400)
+        except Exception:
+            continue
+        if matches:
             try:
-                matches = _uia_match(w, query, None, max_depth=10, max_nodes=400)
+                wt = w.window_text() or ""
             except Exception:
-                continue
-            if matches:
-                try:
-                    wt = w.window_text() or ""
-                except Exception:
-                    wt = ""
-                return {"ok": True, "query": query, "window": wt,
-                        "matches": [info for _, info in matches[:20]]}
-        return {"ok": True, "query": query, "window": None, "matches": []}
+                wt = ""
+            return {"ok": True, "query": query, "window": wt,
+                    "matches": [info for _, info in matches[:20]]}
+    return {"ok": True, "query": query, "window": None, "matches": []}
+
+
+def _screen_overview_impl(elements=True, depth=3, per_window=30):
+    """v1.5.3: /screen overview mode, shared by the endpoint and /macro
+    screen_after (ACT + re-SEE in one round trip)."""
     depth = max(1, min(depth, 8))
     per_window = max(1, min(per_window, 120))
     out = []
@@ -1479,6 +1562,22 @@ def screen(request: Request, query: str = "", elements: bool = True,
             entry["elements"] = els
         out.append(entry)
     return {"ok": True, "count": len(out), "windows": out}
+
+
+@app.get("/screen")
+def screen(request: Request, query: str = "", elements: bool = True,
+           depth: int = 3, per_window: int = 30):
+    """v1.5.0: the semantic screen -- ONE call instead of screenshot + vision
+    analysis. Overview mode (no query): every top-level window + rect (+ a
+    shallow element list each). Query mode: /screen?query=Text+Document
+    finds that element in ANY window (open context menus / submenus included
+    -- they have no title) and returns exact rects; first matching window
+    wins. This is the fast way to answer where-is-X-on-screen-right-now
+    without any screenshot."""
+    guard(request)
+    if (query or "").strip():
+        return _screen_query_impl(query)
+    return _screen_overview_impl(elements, depth, per_window)
 
 
 @app.post("/uiclick")
@@ -1564,8 +1663,117 @@ def macro(inp: MacroIn, request: Request):
             shot_b64 = base64.b64encode(buf.getvalue()).decode()
         except Exception:
             pass
+    # v1.5.3: ACT + re-SEE / ACT + VERIFY in this same round trip
+    screen = None
+    try:
+        if (inp.screen_query or "").strip():
+            screen = _screen_query_impl(inp.screen_query)
+        elif inp.screen_after:
+            screen = _screen_overview_impl(elements=False)   # windows+rects: fast
+    except Exception as e:
+        screen = {"ok": False, "error": str(e)[:200]}
     return {"ok": all(r["ok"] for r in results), "elapsed": round(time.time() - t0, 2),
-            "results": results, "screenshot": shot_b64}
+            "results": results, "screenshot": shot_b64, "screen": screen}
+
+
+# ------------------------------------- v1.5.3: local vision LLM ----
+_OLLAMA_CACHE = {"t": 0.0, "data": None}     # /health: don't hammer ollama
+_VLM_HINTS = ("vl", "vision", "llava", "moondream", "minicpm-v", "gemma3")
+# localhost opener with proxies DISABLED: on Windows, urllib honors the
+# registry proxy (VPN/Clash/etc.) and would misroute 127.0.0.1 calls.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _ollama_models(timeout=1.0):
+    """Installed ollama model names ([] when ollama is down). Cached 30s."""
+    now = time.time()
+    if _OLLAMA_CACHE["data"] is not None and now - _OLLAMA_CACHE["t"] < 30:
+        return _OLLAMA_CACHE["data"]
+    names = []
+    try:
+        req = urllib.request.Request(OLLAMA_URL + "/api/tags", method="GET")
+        with _OPENER.open(req, timeout=timeout) as r:
+            for m in json.loads(r.read().decode() or "{}").get("models", []):
+                n = m.get("name") or m.get("model") or ""
+                if n:
+                    names.append(n)
+    except Exception:
+        names = []
+    _OLLAMA_CACHE["t"], _OLLAMA_CACHE["data"] = now, names
+    return names
+
+
+def _ollama_pick_vlm():
+    """Default vision model: OLLAMA_VLM env > first installed model whose
+    name looks vision-capable > qwen2.5vl:3b (the recommended pull)."""
+    if OLLAMA_VLM:
+        return OLLAMA_VLM
+    for n in _ollama_models():
+        if any(h in n.lower() for h in _VLM_HINTS):
+            return n
+    return "qwen2.5vl:3b"
+
+
+@app.post("/vdescribe")
+def vdescribe(inp: VDescribeIn, request: Request):
+    """v1.5.3: the LOCAL vision LLM (Ollama) reads the screen and answers in
+    TEXT. Capture + LANCZOS downscale + JPEG encode happen ON the PC; only
+    the model's answer crosses the tunnel -- pixels never leave. Use it to
+    read rendered content the UIA tree does not expose (canvas, images,
+    PDF text, game state); verify STRUCTURE semantically (/screen, /ui)
+    first -- that is still cheaper."""
+    guard(request)
+    model = (inp.model or "").strip() or _ollama_pick_vlm()
+    t0 = time.time()
+    img = _capture_screen()        # bar hidden/cloaked, always restored after
+    if inp.region:
+        try:
+            x, y, w, h = [int(v) for v in inp.region.split(",")]
+            img = img.crop((x, y, x + w, y + h))
+        except Exception:
+            return {"ok": False, "error": "region must be x,y,w,h integers"}
+    sc = max(0.1, min(float(inp.scale or 0.5), 1.0))
+    if sc < 1.0:
+        resample = getattr(Image, "Resampling", Image).LANCZOS
+        img = img.resize((max(1, int(img.width * sc)), max(1, int(img.height * sc))),
+                         resample)
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, "JPEG", quality=max(1, min(inp.q, 95)))
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    ms_capture = round((time.time() - t0) * 1000)
+    payload = {"model": model, "stream": False,
+               "messages": [{"role": "user", "content": inp.prompt,
+                             "images": [b64]}],
+               "options": {"temperature": 0.1,
+                           "num_predict": max(50, min(inp.max_tokens, 2000))}}
+    t1 = time.time()
+    try:
+        req = urllib.request.Request(
+            OLLAMA_URL + "/api/chat", data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with _OPENER.open(req, timeout=max(5, min(inp.timeout, 120))) as r:
+            data = json.loads(r.read().decode() or "{}")
+    except Exception as e:
+        hint = ""
+        low = str(e).lower()
+        if "refused" in low or "connect" in low or "timed out" in low:
+            hint = "ollama is not running on the PC? start it, then retry"
+        elif "404" in low or "not found" in low:
+            hint = "model not pulled?  ollama pull %s" % model
+        return {"ok": False, "error": str(e)[:300], "hint": hint}
+    err = data.get("error")
+    if err:
+        return {"ok": False, "error": str(err)[:300],
+                "hint": "model not pulled?  ollama pull %s" % model}
+    text = ((data.get("message") or {}).get("content") or "").strip()
+    if not text:
+        return {"ok": False, "error": "empty answer from %s" % model,
+                "raw": str(data)[:300]}
+    return {"ok": True, "model": model, "text": text,
+            "image": {"w": img.width, "h": img.height, "scale": sc, "q": inp.q},
+            "ms_capture": ms_capture,
+            "ms_vlm": round((time.time() - t1) * 1000),
+            "total_ms": round((time.time() - t0) * 1000)}
 
 
 # --------------------------------------------- v1.1: file transfer ----
