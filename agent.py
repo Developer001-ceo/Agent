@@ -1,44 +1,57 @@
 """
-agent.py -- Remote Test Agent for Windows  (v1.6.1)
+agent.py -- Remote Test Agent for Windows  (v1.5.3)
 ====================================================
-v1.6.1 VISION SYSTEM PROMPT (stateless local eyes):
-  Every /vision call now opens with a proper SYSTEM message instead of a
-  prompt prefix glued onto the question. The default system prompt declares
-  the STATELESS contract: each request is a brand-new context with exactly
-  ONE image and ONE question -- no history comes in, nothing is kept after
-  (the cloud AI owns the conversation; the local model's one job is to
-  describe). Together with the agent never sending chat history to Ollama,
-  the vision context starts at ZERO tokens on every call -- the "request
-  exceeds the available context size" failure of an interactive REPL
-  session cannot happen through the agent.
-  Configurable: env VISION_SYSTEM_PROMPT (PC-wide default) and an optional
-  "system_prompt" field on /vision, /visionclick and the macro visionclick
-  step (one-call override -- keep the JSON+box reply contract in any custom
-  prompt or boxes stop being clickable). The response says which ran:
-  "system_prompt": "default" | "env" | "custom".
+v1.5.3 THE TURBO LOOP (one round trip per iteration, local vision):
+  The v1.5.2 demo showed where the remaining seconds hide: conservative
+  fixed sleeps while waiting for apps to appear, a second round trip to
+  re-SEE after acting, and remote vision calls for content reads. Fix:
+  MACRO STEP
+    "waitfor"       -> {"action":"waitfor","title":"Notepad"} or
+                        {"action":"waitfor","name":"File name"} blocks
+                        SERVER-SIDE, polling every 150ms (window titles via
+                        pygetwindow) / 300ms (UIA element names), and the
+                        macro resumes the INSTANT the target shows up
+                        (timeout_ms default 5000, cap 15000). Fixed sleep
+                        steps are dead: app-launch waits become actual
+                        ~800-1200ms instead of a guessed 3000ms.
+  POST /macro
+    screen_after     -> true: the macro RESPONSE carries a fresh window
+                        overview (title+rect+pid/exe) -- ACT and re-SEE in
+                        ONE round trip.
+    screen_query     -> "Text Document": response carries /screen query
+                        matches instead (exact rects right after the flow)
+                        -- ACT + semantic VERIFY in ONE round trip.
+  POST /vdescribe    -> the LOCAL vision LLM (Ollama) reads the screen and
+                        answers in TEXT. Capture + LANCZOS scale + JPEG q
+                        all happen ON the PC; only the answer text crosses
+                        the tunnel (pixels never leave). RTX-class GPU:
+                        ~0.3-1s total vs ~3-5s for a remote vision call.
+                        Model: "model" field or OLLAMA_VLM env, auto-pick
+                        falls back to qwen2.5vl:3b. Pull once:
+                        ollama pull qwen2.5vl:3b   (or qwen2.5vl:7b).
+  GET  /health       -> now reports "ollama": bool and "vlm":
+                        {"default", "installed":[...]} so the AI knows
+                        before the first /vdescribe.
+  VERIFY DOCTRINE: verify STRUCTURE semantically first (/macro
+  screen_query, /screen?query=, /ui). /vdescribe only to READ rendered
+  content the tree does not expose (canvas, images, PDF text). 
+  /screenshot only when a human-eye artifact is genuinely required.
 
-v1.6.0 LOCAL VISION TIER (Ollama on the PC -- fast eyes, no rate limits):
-  The cloud AI's own vision on screenshots stays the LAST resort: it costs
-  30-120s per look and trips provider rate limits. Tier 3 is now a small
-  VLM served by Ollama on 127.0.0.1:11434 (localhost only, never exposed
-  through the tunnel; default model qwen2.5vl:7b-q8_0):
-  POST /vision        -> ask the local model about a bar-free screenshot:
-                         {"prompt":"where is the Download button?"} -> JSON
-                         with desc + boxes in FULL-screen pixel coordinates
-                         (captured image is downscaled to max_size=1280 for
-                         inference, coordinates mapped back afterwards).
-                         ~2-8s on a modern GPU. Zero rate limits.
-  POST /visionclick   -> /vision + click boxes[index] in one atomic call
-                         (same contract as /clickfind: found:false +
-                         clicked:null when nothing matched).
-  /macro "visionclick" step -> the same inside a whole-flow macro.
-  GET  /health        -> new "vision" block: is Ollama up, which model
-                         resolved, what is installed.
-  Config via env: OLLAMA_URL, VISION_MODEL, VISION_MAX_SIZE,
-                  VISION_TIMEOUT, VISION_NUM_CTX, VISION_KEEP_ALIVE,
-                  VISION_SYSTEM_PROMPT.
-  Speed doctrine is now four tiers: UIA semantic tree -> template matching
-  (/find) -> LOCAL VLM (/vision) -> cloud vision (last resort).
+v1.5.2 VISION-COST CONTROL (screenshot analysis is the #1 time sink):
+  The #1 slowdown reported in live sessions is still the AI analyzing
+  full-size screenshots through a vision model. This release makes the
+  cheap path cheaper and the expensive path disciplined:
+  GET  /screenshot  new "scale" param (0.1-1.0, LANCZOS downscale BEFORE
+                     encoding) + default quality 85 -> 60. A 2560x1600
+                     screen at scale=0.5 & q=60 is ~3-6x smaller: faster
+                     through the tunnel, cheaper to analyze. Response
+                     headers X-Screen-W / X-Screen-H / X-Screen-Scale give
+                     the ACTUAL image size (map coords back by 1/scale if
+                     you must -- or use /find, which matches FULL-screen).
+  POST /macro        new "screenshot_scale" param (default 1.0); default
+                     screenshot_q 80 -> 60 for the end-of-flow capture.
+  The doctrine (enforced by Prompt.md v1.5.2): plan and act semantically
+  (/screen, /ui, /uiclick, /macro); screenshots only VERIFY milestones.
 
 v1.5.0 SPEED REDESIGN ("semantic-first" control -- 10-20x faster, fewer errors):
   ROOT CAUSE of the 1-2 minute pauses in v1.4.0 sessions: the AI looked at
@@ -158,7 +171,7 @@ pyautogui.PAUSE = 0.05
 TOKEN = "Czj3u9HadjO-PkEMw9X9VR_S02v_ZXKMD9CcFT1WADs"
 HOST = "127.0.0.1"          # localhost only -- never change to 0.0.0.0
 PORT = 8787
-VERSION = "1.6.1"
+VERSION = "1.5.3"
 AGENT_ROOT = os.path.dirname(os.path.abspath(__file__))
 JOBS_DIR = os.path.join(AGENT_ROOT, "jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
@@ -166,6 +179,9 @@ os.makedirs(JOBS_DIR, exist_ok=True)
 MACRO_TIME_CAP = 30.0       # seconds per /macro call (tunnel friendly)
 MACRO_SLEEP_CAP = 10.0      # max seconds per sleep step
 MACRO_RUN_CAP = 25          # max timeout per run step inside a macro
+MACRO_WAITFOR_CAP_MS = 15000  # v1.5.3: max wait per waitfor step
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+OLLAMA_VLM = os.environ.get("OLLAMA_VLM", "")  # v1.5.3: force a vision model
 
 app = FastAPI(title="win-agent", docs_url=None, redoc_url=None, openapi_url=None)
 # v1.5.0: compress JSON responses (5-10x smaller through the tunnel: /ui,
@@ -552,7 +568,21 @@ class MacroIn(BaseModel):
     steps: List[dict]
     stop_on_error: bool = True
     capture: bool = True
-    screenshot_q: int = 80
+    screenshot_q: int = 60          # v1.5.2: 80 -> 60 (verification quality)
+    screenshot_scale: float = 1.0   # v1.5.2: <1.0 downscales the capture
+    screen_after: bool = False      # v1.5.3: window overview in the response
+    screen_query: str = ""         # v1.5.3: query-mode matches in the response
+
+
+class VDescribeIn(BaseModel):
+    """v1.5.3: LOCAL vision LLM (Ollama) reads the screen, answers in text."""
+    prompt: str = "Describe the screen briefly. Be concise."
+    model: str = ""               # "" -> OLLAMA_VLM env > installed vlm > qwen2.5vl:3b
+    q: int = 60
+    scale: float = 0.5
+    region: Optional[str] = None   # x,y,w,h -- read just that part
+    max_tokens: int = 400
+    timeout: int = 45
 
 
 class UploadIn(BaseModel):
@@ -1037,6 +1067,36 @@ def _s_window(s):
     return {"title": w.title}
 
 
+def _s_waitfor(s):
+    """v1.5.3: block server-side until a window title (pygetwindow, fast)
+    or a UIA element name appears, then return the instant it does.
+    Replaces conservative fixed sleeps -- the macro resumes the moment
+    the app is actually there. Raises on timeout so stop_on_error sees
+    a failed launch cleanly."""
+    title = s.get("title")
+    name = s.get("name")
+    if not title and not name:
+        raise RuntimeError("waitfor: needs title= and/or name=")
+    timeout_ms = min(int(s.get("timeout_ms", 5000)), MACRO_WAITFOR_CAP_MS)
+    poll_ms = max(50, int(s.get("poll_ms", 150 if title else 300)))
+    t0 = time.time()
+    while (time.time() - t0) * 1000 < timeout_ms:
+        if title:
+            import pygetwindow as gw
+            if any(title.lower() in (w.title or "").lower()
+                   for w in gw.getAllWindows()):
+                return {"waited_ms": round((time.time() - t0) * 1000),
+                        "found": "title:%s" % title}
+        if name:
+            _, matches = _uia_find_any(name, None, 0)
+            if matches:
+                return {"waited_ms": round((time.time() - t0) * 1000),
+                        "found": "name:%s" % name}
+        time.sleep(poll_ms / 1000.0)
+    raise RuntimeError("waitfor: timed out after %dms waiting for %s"
+                       % (timeout_ms, title or name))
+
+
 def _s_run(s):
     shell = s.get("shell", "powershell")
     cmd = s["command"]
@@ -1111,6 +1171,7 @@ MACRO_ACTIONS = {
     "type": _s_type, "key": _s_key, "sleep": _s_sleep, "window": _s_window,
     "run": _s_run, "adb": _s_adb,
     "uiclick": _s_uiclick, "uiset": _s_uiset,      # v1.5.0 semantic steps
+    "waitfor": _s_waitfor,                         # v1.5.3: event-driven waits
 }
 
 
@@ -1134,13 +1195,17 @@ def health(request: Request):
         "playwright": importlib.util.find_spec("playwright") is not None,
         "awake": AWAKE_FLAG["on"],
         "indicator": _port_listening(INDICATOR_PORT),
-        "vision": _vision_health(),          # v1.6.0: local VLM tier (Ollama)
+        "ollama": bool(_ollama_models()),                    # v1.5.3
+        "vlm": {"default": _ollama_pick_vlm(),              # v1.5.3
+                "installed": [m for m in _ollama_models()
+                              if any(h in m.lower() for h in _VLM_HINTS)]},
         "agent_version": VERSION,
     }
 
 
 @app.get("/screenshot")
-def screenshot(request: Request, fmt: str = "jpeg", q: int = 85, region: Optional[str] = None):
+def screenshot(request: Request, fmt: str = "jpeg", q: int = 60, region: Optional[str] = None,
+               scale: float = 1.0):
     guard(request)
     img = _capture_screen()        # bar hidden/cloaked, always restored after
     if region:
@@ -1149,6 +1214,14 @@ def screenshot(request: Request, fmt: str = "jpeg", q: int = 85, region: Optiona
             img = img.crop((x, y, x + w, y + h))
         except Exception:
             raise HTTPException(status_code=400, detail="region must be x,y,w,h")
+    # v1.5.2: downscale BEFORE encoding -- scale=0.5 & q=60 is the standard
+    # verification shot: 3-6x smaller through the tunnel and much cheaper
+    # to analyze on the rare occasion a vision check is genuinely needed.
+    scale = max(0.1, min(float(scale or 1.0), 1.0))
+    if scale < 1.0:
+        resample = getattr(Image, "Resampling", Image).LANCZOS
+        img = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))),
+                         resample)
     buf = io.BytesIO()
     if fmt == "png":
         img.save(buf, "PNG")
@@ -1156,7 +1229,13 @@ def screenshot(request: Request, fmt: str = "jpeg", q: int = 85, region: Optiona
     else:
         img.convert("RGB").save(buf, "JPEG", quality=max(1, min(q, 95)))
         media = "image/jpeg"
-    return Response(content=buf.getvalue(), media_type=media)
+    # v1.5.2: tell the caller the ACTUAL pixel size of the returned image
+    # (coords seen in a scaled shot must be multiplied by 1/scale to map
+    # back to the real screen -- or just use /find, which matches the
+    # FULL-resolution screen and returns exact centers).
+    return Response(content=buf.getvalue(), media_type=media,
+                    headers={"X-Screen-W": str(img.width), "X-Screen-H": str(img.height),
+                             "X-Screen-Scale": "%.3f" % scale})
 
 
 @app.get("/windows")
@@ -1323,490 +1402,6 @@ def clickfind(inp: FindIn, request: Request):
             "clicked": {"x": m["x"], "y": m["y"]}}
 
 
-# -------------------------------------------- v1.6.0: LOCAL vision tier ----
-# The speed doctrine gets a third tier of eyes: a small VLM served by Ollama
-# on the SAME PC (127.0.0.1:11434, localhost only -- never exposed through
-# the tunnel). The cloud AI sends a question, the agent grabs a bar-free
-# screenshot, downscales it (default 1280px longest edge -- roughly halves
-# latency with no real accuracy loss on UI shots), asks the local model and
-# returns JSON whose bounding boxes are already mapped back to FULL-screen
-# pixel coordinates -- the same {x,y,left,top,w,h} shape /find returns, so
-# the boxes are immediately clickable.
-#   tier 1: UIA semantic tree (/screen, /ui, /uiclick)      ~1-3s, exact
-#   tier 2: template matching (/find, /clickfind)           pixel-exact
-#   tier 3: LOCAL VLM (/vision, /visionclick)               ~2-8s on GPU
-#   tier 4: the cloud AI's own vision on /screenshot        last resort
-# Setup on the PC (once): install Ollama from https://ollama.com, then
-#   ollama pull qwen2.5vl:7b-q8_0
-# Config via environment variables (all optional):
-#   OLLAMA_URL        default http://127.0.0.1:11434
-#   VISION_MODEL      default qwen2.5vl:7b-q8_0 (any installed qwen2.5vl tag
-#                     is auto-picked when the default is missing)
-#   VISION_MAX_SIZE   default 1280    (longest edge sent for inference)
-#   VISION_TIMEOUT    default 90      (first call loads weights: 10-30s)
-#   VISION_NUM_CTX    default 8192    (the image alone eats ~1-2k tokens)
-#   VISION_KEEP_ALIVE default 30m     (model stays warm between calls)
-#   VISION_SYSTEM_PROMPT  replaces the default STATELESS system message
-#                     sent with every /vision call (one job: describe;
-#                     fresh context per request); the per-request
-#                     "system_prompt" field overrides it for ONE call
-
-VISION_URL = (os.environ.get("OLLAMA_URL") or "http://127.0.0.1:11434").rstrip("/")
-VISION_DEFAULT_MODEL = (os.environ.get("VISION_MODEL") or "qwen2.5vl:7b-q8_0").strip()
-VISION_MAX_SIZE_DEFAULT = int(os.environ.get("VISION_MAX_SIZE") or 1280)
-VISION_TIMEOUT_DEFAULT = int(os.environ.get("VISION_TIMEOUT") or 90)
-VISION_NUM_CTX = int(os.environ.get("VISION_NUM_CTX") or 8192)
-VISION_KEEP_ALIVE = os.environ.get("VISION_KEEP_ALIVE") or "30m"
-
-_VISION_LOCK = threading.Lock()   # one capture + one Ollama call at a time
-
-_VISION_SYSTEM_PROMPT_DEFAULT = (
-    "You are the vision unit of a desktop automation agent, running locally "
-    "on the operator's PC.\n"
-    "STATELESS SERVICE: your context is cleared before and after EVERY "
-    "request. Each request is a brand-new, independent context containing "
-    "exactly ONE screenshot and ONE question -- no conversation history "
-    "comes in and nothing is kept afterwards. You have NO memory of earlier "
-    "images or questions; the conversation lives in the operator's cloud "
-    "model, not in you. Never refer to previous requests; answer only from "
-    "THIS image.\n"
-    "Your one job is to describe. Reply with ONE JSON object, nothing else:\n"
-    '{"desc": "short answer to the question", "boxes": '
-    '[{"label": "what this is", "box": [x1, y1, x2, y2]}]}\n'
-    "Rules:\n"
-    "- box = [left, top, right, bottom], ABSOLUTE PIXEL coordinates of THIS "
-    "image, origin at the top-left corner.\n"
-    "- One box for every element the operator might need to act on (max 10); "
-    "boxes tight around each element.\n"
-    '- If nothing matches, reply {"desc": "...", "boxes": []}.\n'
-)
-# v1.6.1: the system message every /vision call opens with. Replace the
-# default PC-wide via env VISION_SYSTEM_PROMPT, or for ONE call via the
-# "system_prompt" field on /vision, /visionclick and the macro visionclick
-# step. Keep the JSON+box reply contract in any custom prompt -- the agent
-# parses it into clickable full-screen boxes.
-_VISION_SP_FROM_ENV = bool((os.environ.get("VISION_SYSTEM_PROMPT") or "").strip())
-VISION_SYSTEM_PROMPT = ((os.environ.get("VISION_SYSTEM_PROMPT") or "").strip()
-                        or _VISION_SYSTEM_PROMPT_DEFAULT)
-
-
-def _ollama_models():
-    """Installed model names from GET /api/tags, or None when Ollama is not
-    reachable (a refused localhost connection is instant, so this is cheap
-    enough to call on every /health)."""
-    try:
-        with urllib.request.urlopen(VISION_URL + "/api/tags", timeout=2) as r:
-            data = json.loads(r.read().decode("utf-8"))
-        return [m.get("name") or m.get("model") for m in data.get("models", [])
-                if (m.get("name") or m.get("model"))]
-    except Exception:
-        return None
-
-
-def _vision_pick_model(explicit=None):
-    """-> (model, error_dict_or_None). Resolution order: an explicit request
-    wins; otherwise the configured default when installed; otherwise ANY
-    installed qwen2.5vl tag (a 7b one preferred); otherwise any *vl*/*vision*
-    model; otherwise the default with a pull hint."""
-    want = (explicit or VISION_DEFAULT_MODEL).strip()
-    if explicit:
-        return want, None                      # caller knows best
-    models = _ollama_models()
-    if models is None:
-        return want, {"ok": False,
-                      "error": "Ollama is not reachable at %s" % VISION_URL,
-                      "hint": "start the Ollama app (system tray) on the PC, "
-                              "then: ollama pull %s" % want}
-    if want in models:
-        return want, None
-    vl = [m for m in models if "qwen2.5vl" in m]
-    if vl:
-        best = [m for m in vl if "7b" in m] or vl
-        return sorted(best)[0], None
-    anyvl = [m for m in models if "vl" in m.lower() or "vision" in m.lower()]
-    if anyvl:
-        return sorted(anyvl)[0], None
-    return want, {"ok": False, "error": "no vision model installed in Ollama",
-                  "hint": "on the PC run: ollama pull %s" % want,
-                  "installed": models[:20]}
-
-
-def _vision_health():
-    """Block for GET /health: is the local vision tier usable right now?"""
-    models = _ollama_models()
-    if models is None:
-        return {"ok": False, "url": VISION_URL,
-                "hint": "install/start Ollama, then: ollama pull %s"
-                        % VISION_DEFAULT_MODEL}
-    model, _err = _vision_pick_model()
-    return {"ok": True, "url": VISION_URL, "model": model,
-            "installed": models[:20]}
-
-
-def _vision_json_obj(text):
-    """Model output -> JSON dict, or None. Handles plain JSON, markdown
-    fences and JSON buried in prose (first '{' .. last '}')."""
-    t = (text or "").strip()
-    if t.startswith("```"):
-        t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
-        t = re.sub(r"\s*```\s*$", "", t)
-    try:
-        v = json.loads(t)
-        if isinstance(v, dict):
-            return v
-    except Exception:
-        pass
-    a, b = t.find("{"), t.rfind("}")
-    if a >= 0 and b > a:
-        try:
-            v = json.loads(t[a:b + 1])
-            if isinstance(v, dict):
-                return v
-        except Exception:
-            pass
-    return None
-
-
-def _vision_nums(v):
-    """A box value in list/tuple/string form -> [x1, y1, x2, y2], or None."""
-    if isinstance(v, (list, tuple)):
-        vals = []
-        for x in list(v)[:4]:
-            try:
-                vals.append(float(x))
-            except Exception:
-                return None
-        return vals if len(vals) == 4 else None
-    if isinstance(v, str):
-        nums = [float(n) for n in re.findall(r"-?\d+(?:\.\d+)?", v)[:4]]
-        return nums if len(nums) == 4 else None
-    return None
-
-
-def _vision_box_from_dict(d):
-    """A box given as a dict of named fields -> [x1, y1, x2, y2], or None."""
-    try:
-        if all(k in d for k in ("x1", "y1", "x2", "y2")):
-            return [float(d["x1"]), float(d["y1"]), float(d["x2"]), float(d["y2"])]
-        if all(k in d for k in ("left", "top", "right", "bottom")):
-            return [float(d["left"]), float(d["top"]),
-                    float(d["right"]), float(d["bottom"])]
-        x, y = d.get("x", d.get("left")), d.get("y", d.get("top"))
-        w, h = d.get("w", d.get("width")), d.get("h", d.get("height"))
-        if None not in (x, y, w, h):
-            return [float(x), float(y), float(x) + float(w), float(y) + float(h)]
-        cx, cy = d.get("cx", d.get("center_x")), d.get("cy", d.get("center_y"))
-        if None not in (cx, cy, w, h):
-            return [float(cx) - float(w) / 2.0, float(cy) - float(h) / 2.0,
-                    float(cx) + float(w) / 2.0, float(cy) + float(h) / 2.0]
-    except Exception:
-        pass
-    return None
-
-
-def _vision_box_norm(entry):
-    """One box entry in ANY of the shapes VLMs like to emit -> (box, label)."""
-    label = ""
-    if isinstance(entry, dict):
-        label = str(entry.get("label") or entry.get("name") or
-                    entry.get("text") or "")
-        for k in ("box", "box_2d", "bbox", "coords", "coord", "rect", "rectangle"):
-            if k in entry:
-                r = _vision_nums(entry[k])
-                if r:
-                    return r, label
-        r = _vision_box_from_dict(entry)
-        if r:
-            return r, label
-        return None, label
-    r = _vision_nums(entry)
-    return (r, label) if r else (None, label)
-
-
-_VISION_PAIR_RE = re.compile(
-    r"\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*,\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)")
-
-
-def _vision_to_screen(bx, label, sx, sy, ox, oy, sw, sh):
-    """[x1,y1,x2,y2] in inference-image pixels -> full-screen box dict (the
-    /find match shape), or None when it degenerates after clamping."""
-    x1, y1, x2, y2 = bx
-    if x2 < x1:
-        x1, x2 = x2, x1
-    if y2 < y1:
-        y1, y2 = y2, y1
-    X1 = int(round(ox + x1 * sx))
-    Y1 = int(round(oy + y1 * sy))
-    X2 = int(round(ox + x2 * sx))
-    Y2 = int(round(oy + y2 * sy))
-    X1, X2 = max(0, min(X1, sw)), max(0, min(X2, sw))
-    Y1, Y2 = max(0, min(Y1, sh)), max(0, min(Y2, sh))
-    if X2 - X1 < 3 or Y2 - Y1 < 3:      # sub-3px boxes are noise, not targets
-        return None
-    return {"label": (label or "")[:80], "left": X1, "top": Y1,
-            "w": X2 - X1, "h": Y2 - Y1, "x": (X1 + X2) // 2, "y": (Y1 + Y2) // 2}
-
-
-def _vision_parse(text, sx, sy, ox, oy, sw, sh):
-    """Model reply -> (desc, boxes) where every box is already in FULL-screen
-    pixels with the /find match shape {label,x,y,left,top,w,h}. Defensive by
-    design: JSON first (Ollama's format:'json' makes this the normal path),
-    Qwen's native '(x1,y1),(x2,y2)' grounding text as the fallback."""
-    boxes = []
-    obj = _vision_json_obj(text)
-    desc = ""
-    if obj is not None:
-        d = obj.get("desc", obj.get("description", obj.get("answer", "")))
-        if isinstance(d, str):
-            desc = d
-        elif d:
-            desc = json.dumps(d)[:300]
-        entries = []
-        for k in ("boxes", "box", "elements", "targets", "items", "results"):
-            v = obj.get(k)
-            if isinstance(v, list) and v:
-                entries = v
-                break
-        if entries and _vision_nums(entries):
-            entries = [obj]              # flat [x1,y1,x2,y2] under one key
-        if not entries:
-            bx, _lab = _vision_box_norm(obj)
-            if bx:
-                entries = [obj]          # the whole object IS one box
-        for entry in entries[:10]:
-            bx, label = _vision_box_norm(entry)
-            if not bx:
-                continue
-            out = _vision_to_screen(bx, label, sx, sy, ox, oy, sw, sh)
-            if out:
-                boxes.append(out)
-    if not boxes:                        # native grounding text fallback
-        for i, m in enumerate(_VISION_PAIR_RE.findall(text or "")[:10]):
-            bx = [float(m[0]), float(m[1]), float(m[2]), float(m[3])]
-            out = _vision_to_screen(bx, "item %d" % (i + 1), sx, sy, ox, oy, sw, sh)
-            if out:
-                boxes.append(out)
-    if not desc:
-        desc = (text or "").strip()[:300]
-    return desc, boxes
-
-
-class VisionIn(BaseModel):
-    prompt: str                               # the question for the local VLM
-    region: Optional[str] = None              # "x,y,w,h" crop of the screen
-    max_size: int = VISION_MAX_SIZE_DEFAULT   # longest edge sent to the model
-    model: Optional[str] = None               # override the resolved model
-    timeout: int = VISION_TIMEOUT_DEFAULT     # Ollama call timeout (seconds)
-    detail: bool = False                      # include the raw model text
-    system_prompt: Optional[str] = None       # v1.6.1: one-call override of
-                                              # the stateless system message
-
-
-class VisionClickIn(VisionIn):
-    button: str = "left"
-    clicks: int = 1
-    index: int = 0                            # which box to click
-
-
-def _vision_analyze(prompt, region, max_size, model, timeout, detail=False,
-                    system_prompt=None):
-    """Shared core of /vision, /visionclick and the macro visionclick step:
-    capture (bar-free) -> optional region crop -> downscale -> local VLM ->
-    boxes mapped back to full-screen pixels. Returns the response dict.
-    v1.6.1: the call opens with a SYSTEM message (stateless describe-only
-    contract; configurable via env VISION_SYSTEM_PROMPT or the per-call
-    system_prompt argument) and sends NO history -- every request is a
-    fresh context, so the model can never accumulate tokens the way an
-    interactive REPL session does."""
-    t0 = time.time()
-    prompt = (prompt or "").strip()[:2000]
-    if not prompt:
-        return {"ok": False, "error": "prompt required"}
-    model, merr = _vision_pick_model(model)
-    if merr:
-        merr["elapsed"] = round(time.time() - t0, 2)
-        return merr
-    sp_src = "env" if _VISION_SP_FROM_ENV else "default"
-    sp = VISION_SYSTEM_PROMPT
-    if system_prompt and str(system_prompt).strip():
-        sp = str(system_prompt).strip()[:4000]      # one-call override wins
-        sp_src = "custom"
-    try:
-        max_size = max(320, min(int(max_size or VISION_MAX_SIZE_DEFAULT), 2560))
-        timeout = max(10, min(int(timeout or VISION_TIMEOUT_DEFAULT), 300))
-    except (TypeError, ValueError):
-        return {"ok": False, "error": "max_size/timeout must be integers"}
-    with _VISION_LOCK:                   # one capture + one Ollama call at a time
-        img = _capture_screen()          # bar hidden/cloaked, always restored
-        sw, sh = pyautogui.size()
-        ox = oy = 0
-        if region:
-            x, y, w, h = region
-            ox, oy = x, y
-            img = img.crop((x, y, x + w, y + h))
-        orig_w, orig_h = img.size
-        scale = min(1.0, float(max_size) / float(max(orig_w, orig_h)))
-        if scale < 1.0:
-            infer_w = max(1, int(round(orig_w * scale)))
-            infer_h = max(1, int(round(orig_h * scale)))
-            img = img.resize((infer_w, infer_h), Image.LANCZOS)
-        else:
-            infer_w, infer_h = orig_w, orig_h
-        buf = io.BytesIO()
-        img.convert("RGB").save(buf, "JPEG", quality=90)
-        b64 = base64.b64encode(buf.getvalue()).decode()
-        payload = {
-            "model": model,
-            "messages": [{"role": "system", "content": sp},
-                          {"role": "user", "content": prompt,
-                           "images": [b64]}],
-            "stream": False,
-            "format": "json",
-            "keep_alive": VISION_KEEP_ALIVE,
-            "options": {"temperature": 0, "num_ctx": VISION_NUM_CTX},
-        }
-        req = urllib.request.Request(
-            VISION_URL + "/api/chat",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"}, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                out = json.loads(r.read().decode("utf-8"))
-        except Exception as e:
-            code = getattr(e, "code", None)
-            body = ""
-            try:
-                body = e.read().decode("utf-8", "replace")[:200]  # HTTPError body
-            except Exception:
-                pass
-            if code == 404:
-                return {"ok": False, "model": model,
-                        "error": "model %r is not installed in Ollama" % model,
-                        "hint": "on the PC run: ollama pull %s" % model,
-                        "elapsed": round(time.time() - t0, 2)}
-            if "timed out" in str(e).lower() or "timeout" in str(e).lower():
-                return {"ok": False, "model": model,
-                        "error": "vision call timed out after %ss" % timeout,
-                        "hint": "the FIRST call after a restart loads the model "
-                                "into VRAM (10-30s) -- just retry; if it persists, "
-                                "lower max_size or pull a smaller quant",
-                        "elapsed": round(time.time() - t0, 2)}
-            if code is not None:
-                return {"ok": False, "model": model,
-                        "error": "ollama HTTP %s: %s" % (code, body),
-                        "elapsed": round(time.time() - t0, 2)}
-            return {"ok": False, "model": model,
-                    "error": "Ollama is not reachable at %s (%s)"
-                             % (VISION_URL, str(e)[:120]),
-                    "hint": "start the Ollama app on the PC (system tray); the "
-                            "agent talks to it on localhost only",
-                    "elapsed": round(time.time() - t0, 2)}
-        text = ((out.get("message") or {}).get("content")) or ""
-        sx = orig_w / float(infer_w)
-        sy = orig_h / float(infer_h)
-        desc, boxes = _vision_parse(text, sx, sy, ox, oy, sw, sh)
-        resp = {"ok": True, "model": model,
-                "elapsed": round(time.time() - t0, 2),
-                "system_prompt": sp_src,
-                "image": {"sent": [infer_w, infer_h],
-                          "captured": [orig_w, orig_h],
-                          "region": [ox, oy, orig_w, orig_h]},
-                "desc": desc, "count": len(boxes), "boxes": boxes}
-        if out.get("prompt_eval_count") is not None:
-            resp["tokens"] = {"prompt": out.get("prompt_eval_count"),
-                              "eval": out.get("eval_count")}
-        if detail or not boxes:
-            resp["raw"] = (text or "")[:1500]
-        return resp
-
-
-@app.post("/vision")
-def vision(inp: VisionIn, request: Request):
-    """Ask the LOCAL VLM (Ollama, same PC) about the current screen: one
-    round trip, ~2-8s on a modern GPU, no cloud rate limits. Boxes come back
-    in FULL-screen pixel coordinates -- the same shape /find returns -- so
-    they can be clicked directly. Use it for non-UIA targets and milestone
-    verification; the semantic tree (/screen, /ui) is still the first tier.
-    v1.6.1: an optional "system_prompt" field replaces the default
-    stateless system message for THIS call (the response's
-    "system_prompt": "default|env|custom" says which one ran)."""
-    guard(request)
-    region = _parse_region(inp.region)
-    return _vision_analyze(inp.prompt, region, inp.max_size, inp.model,
-                           inp.timeout, inp.detail, inp.system_prompt)
-
-
-@app.post("/visionclick")
-def visionclick(inp: VisionClickIn, request: Request):
-    """/vision + click boxes[index] in one atomic call. found:false +
-    clicked:null when the model saw no matching element -- never click
-    blindly after that. The click moves the REAL mouse (visible-operation
-    mandate), same as /clickfind."""
-    guard(request)
-    if inp.button not in ("left", "right", "middle"):
-        raise HTTPException(status_code=400, detail="button must be left|right|middle")
-    region = _parse_region(inp.region)
-    out = _vision_analyze(inp.prompt, region, inp.max_size, inp.model,
-                          inp.timeout, inp.detail, inp.system_prompt)
-    if not out.get("ok"):
-        return out
-    boxes = out.get("boxes") or []
-    if not boxes:
-        return {"ok": True, "found": False, "count": 0, "boxes": [],
-                "desc": out.get("desc"), "model": out.get("model"),
-                "elapsed": out.get("elapsed"), "system_prompt": out.get("system_prompt"),
-                "clicked": None}
-    if inp.index >= len(boxes):
-        return {"ok": False,
-                "error": "only %d boxes (index %d too high)" % (len(boxes), inp.index),
-                "boxes": boxes, "elapsed": out.get("elapsed"),
-                "system_prompt": out.get("system_prompt")}
-    b = boxes[inp.index]
-    with _input_lock:
-        pyautogui.click(x=b["x"], y=b["y"], clicks=max(1, inp.clicks),
-                        button=inp.button)
-    return {"ok": True, "found": True, "count": len(boxes), "boxes": boxes,
-            "clicked": {"x": b["x"], "y": b["y"], "label": b.get("label")},
-            "desc": out.get("desc"), "model": out.get("model"),
-            "elapsed": out.get("elapsed"), "system_prompt": out.get("system_prompt")}
-
-
-def _s_visionclick(s):
-    """v1.6.0: local-VLM guided click inside a macro (see /visionclick).
-    v1.6.1: optional "system_prompt" step field overrides the vision system
-    message for this one call.
-    NOTE: deliberately NOT in the macro dispatcher's _input_lock list -- the
-    vision call itself must not block other input actions; this helper takes
-    the lock for the click only. timeout is capped at 25s to respect the 30s
-    macro budget."""
-    region = _parse_region(s.get("region")) if s.get("region") else None
-    out = _vision_analyze(s["prompt"], region,
-                          int(s.get("max_size", VISION_MAX_SIZE_DEFAULT)),
-                          s.get("model"),
-                          min(int(s.get("timeout", 25)), 25),
-                          system_prompt=s.get("system_prompt"))
-    if not out.get("ok"):
-        raise RuntimeError("visionclick: %s" % out.get("error"))
-    boxes = out.get("boxes") or []
-    if not boxes:
-        raise RuntimeError("visionclick: the local vision model saw nothing "
-                           "matching %r" % s["prompt"])
-    idx = int(s.get("index", 0))
-    if idx >= len(boxes):
-        raise RuntimeError("visionclick: only %d boxes" % len(boxes))
-    b = boxes[idx]
-    with _input_lock:
-        pyautogui.click(x=b["x"], y=b["y"], clicks=int(s.get("clicks", 1)),
-                        button=s.get("button", "left"))
-    return {"clicked": b, "desc": out.get("desc"), "method": "local-vlm"}
-
-
-MACRO_ACTIONS["visionclick"] = _s_visionclick   # v1.6.0 (the dispatcher's
-                                                 # error list picks it up too)
-
-# ------------------------------- end v1.6.0: LOCAL vision tier -----------------
-
-
 @app.post("/drag")
 def drag(inp: DragIn, request: Request):
     guard(request)
@@ -1918,31 +1513,27 @@ def ui_tree(request: Request, title: str, max_depth: int = 10, max_nodes: int = 
             "truncated": truncated, "elements": nodes}
 
 
-@app.get("/screen")
-def screen(request: Request, query: str = "", elements: bool = True,
-           depth: int = 3, per_window: int = 30):
-    """v1.5.0: the semantic screen -- ONE call instead of screenshot + vision
-    analysis. Overview mode (no query): every top-level window + rect (+ a
-    shallow element list each). Query mode: /screen?query=Text+Document
-    finds that element in ANY window (open context menus / submenus included
-    -- they have no title) and returns exact rects; first matching window
-    wins. This is the fast way to answer where-is-X-on-screen-right-now
-    without any screenshot."""
-    guard(request)
-    if (query or "").strip():
-        for w in _uia_desktop().windows():
+def _screen_query_impl(query):
+    """v1.5.3: /screen query mode, shared by the endpoint and /macro
+    screen_query (ACT + semantic VERIFY in one round trip)."""
+    for w in _uia_desktop().windows():
+        try:
+            matches = _uia_match(w, query, None, max_depth=10, max_nodes=400)
+        except Exception:
+            continue
+        if matches:
             try:
-                matches = _uia_match(w, query, None, max_depth=10, max_nodes=400)
+                wt = w.window_text() or ""
             except Exception:
-                continue
-            if matches:
-                try:
-                    wt = w.window_text() or ""
-                except Exception:
-                    wt = ""
-                return {"ok": True, "query": query, "window": wt,
-                        "matches": [info for _, info in matches[:20]]}
-        return {"ok": True, "query": query, "window": None, "matches": []}
+                wt = ""
+            return {"ok": True, "query": query, "window": wt,
+                    "matches": [info for _, info in matches[:20]]}
+    return {"ok": True, "query": query, "window": None, "matches": []}
+
+
+def _screen_overview_impl(elements=True, depth=3, per_window=30):
+    """v1.5.3: /screen overview mode, shared by the endpoint and /macro
+    screen_after (ACT + re-SEE in one round trip)."""
     depth = max(1, min(depth, 8))
     per_window = max(1, min(per_window, 120))
     out = []
@@ -1971,6 +1562,22 @@ def screen(request: Request, query: str = "", elements: bool = True,
             entry["elements"] = els
         out.append(entry)
     return {"ok": True, "count": len(out), "windows": out}
+
+
+@app.get("/screen")
+def screen(request: Request, query: str = "", elements: bool = True,
+           depth: int = 3, per_window: int = 30):
+    """v1.5.0: the semantic screen -- ONE call instead of screenshot + vision
+    analysis. Overview mode (no query): every top-level window + rect (+ a
+    shallow element list each). Query mode: /screen?query=Text+Document
+    finds that element in ANY window (open context menus / submenus included
+    -- they have no title) and returns exact rects; first matching window
+    wins. This is the fast way to answer where-is-X-on-screen-right-now
+    without any screenshot."""
+    guard(request)
+    if (query or "").strip():
+        return _screen_query_impl(query)
+    return _screen_overview_impl(elements, depth, per_window)
 
 
 @app.post("/uiclick")
@@ -2045,13 +1652,128 @@ def macro(inp: MacroIn, request: Request):
     if inp.capture:
         try:
             img = _capture_screen()   # bar hidden/cloaked, always restored after
+            # v1.5.2: optional downscale of the end-of-flow capture
+            if inp.screenshot_scale and inp.screenshot_scale < 1.0:
+                sc = max(0.1, min(float(inp.screenshot_scale), 1.0))
+                resample = getattr(Image, "Resampling", Image).LANCZOS
+                img = img.resize((max(1, int(img.width * sc)), max(1, int(img.height * sc))),
+                                 resample)
             buf = io.BytesIO()
             img.convert("RGB").save(buf, "JPEG", quality=max(1, min(inp.screenshot_q, 95)))
             shot_b64 = base64.b64encode(buf.getvalue()).decode()
         except Exception:
             pass
+    # v1.5.3: ACT + re-SEE / ACT + VERIFY in this same round trip
+    screen = None
+    try:
+        if (inp.screen_query or "").strip():
+            screen = _screen_query_impl(inp.screen_query)
+        elif inp.screen_after:
+            screen = _screen_overview_impl(elements=False)   # windows+rects: fast
+    except Exception as e:
+        screen = {"ok": False, "error": str(e)[:200]}
     return {"ok": all(r["ok"] for r in results), "elapsed": round(time.time() - t0, 2),
-            "results": results, "screenshot": shot_b64}
+            "results": results, "screenshot": shot_b64, "screen": screen}
+
+
+# ------------------------------------- v1.5.3: local vision LLM ----
+_OLLAMA_CACHE = {"t": 0.0, "data": None}     # /health: don't hammer ollama
+_VLM_HINTS = ("vl", "vision", "llava", "moondream", "minicpm-v", "gemma3")
+# localhost opener with proxies DISABLED: on Windows, urllib honors the
+# registry proxy (VPN/Clash/etc.) and would misroute 127.0.0.1 calls.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _ollama_models(timeout=1.0):
+    """Installed ollama model names ([] when ollama is down). Cached 30s."""
+    now = time.time()
+    if _OLLAMA_CACHE["data"] is not None and now - _OLLAMA_CACHE["t"] < 30:
+        return _OLLAMA_CACHE["data"]
+    names = []
+    try:
+        req = urllib.request.Request(OLLAMA_URL + "/api/tags", method="GET")
+        with _OPENER.open(req, timeout=timeout) as r:
+            for m in json.loads(r.read().decode() or "{}").get("models", []):
+                n = m.get("name") or m.get("model") or ""
+                if n:
+                    names.append(n)
+    except Exception:
+        names = []
+    _OLLAMA_CACHE["t"], _OLLAMA_CACHE["data"] = now, names
+    return names
+
+
+def _ollama_pick_vlm():
+    """Default vision model: OLLAMA_VLM env > first installed model whose
+    name looks vision-capable > qwen2.5vl:3b (the recommended pull)."""
+    if OLLAMA_VLM:
+        return OLLAMA_VLM
+    for n in _ollama_models():
+        if any(h in n.lower() for h in _VLM_HINTS):
+            return n
+    return "qwen2.5vl:3b"
+
+
+@app.post("/vdescribe")
+def vdescribe(inp: VDescribeIn, request: Request):
+    """v1.5.3: the LOCAL vision LLM (Ollama) reads the screen and answers in
+    TEXT. Capture + LANCZOS downscale + JPEG encode happen ON the PC; only
+    the model's answer crosses the tunnel -- pixels never leave. Use it to
+    read rendered content the UIA tree does not expose (canvas, images,
+    PDF text, game state); verify STRUCTURE semantically (/screen, /ui)
+    first -- that is still cheaper."""
+    guard(request)
+    model = (inp.model or "").strip() or _ollama_pick_vlm()
+    t0 = time.time()
+    img = _capture_screen()        # bar hidden/cloaked, always restored after
+    if inp.region:
+        try:
+            x, y, w, h = [int(v) for v in inp.region.split(",")]
+            img = img.crop((x, y, x + w, y + h))
+        except Exception:
+            return {"ok": False, "error": "region must be x,y,w,h integers"}
+    sc = max(0.1, min(float(inp.scale or 0.5), 1.0))
+    if sc < 1.0:
+        resample = getattr(Image, "Resampling", Image).LANCZOS
+        img = img.resize((max(1, int(img.width * sc)), max(1, int(img.height * sc))),
+                         resample)
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, "JPEG", quality=max(1, min(inp.q, 95)))
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    ms_capture = round((time.time() - t0) * 1000)
+    payload = {"model": model, "stream": False,
+               "messages": [{"role": "user", "content": inp.prompt,
+                             "images": [b64]}],
+               "options": {"temperature": 0.1,
+                           "num_predict": max(50, min(inp.max_tokens, 2000))}}
+    t1 = time.time()
+    try:
+        req = urllib.request.Request(
+            OLLAMA_URL + "/api/chat", data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with _OPENER.open(req, timeout=max(5, min(inp.timeout, 120))) as r:
+            data = json.loads(r.read().decode() or "{}")
+    except Exception as e:
+        hint = ""
+        low = str(e).lower()
+        if "refused" in low or "connect" in low or "timed out" in low:
+            hint = "ollama is not running on the PC? start it, then retry"
+        elif "404" in low or "not found" in low:
+            hint = "model not pulled?  ollama pull %s" % model
+        return {"ok": False, "error": str(e)[:300], "hint": hint}
+    err = data.get("error")
+    if err:
+        return {"ok": False, "error": str(err)[:300],
+                "hint": "model not pulled?  ollama pull %s" % model}
+    text = ((data.get("message") or {}).get("content") or "").strip()
+    if not text:
+        return {"ok": False, "error": "empty answer from %s" % model,
+                "raw": str(data)[:300]}
+    return {"ok": True, "model": model, "text": text,
+            "image": {"w": img.width, "h": img.height, "scale": sc, "q": inp.q},
+            "ms_capture": ms_capture,
+            "ms_vlm": round((time.time() - t1) * 1000),
+            "total_ms": round((time.time() - t0) * 1000)}
 
 
 # --------------------------------------------- v1.1: file transfer ----
