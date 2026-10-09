@@ -59,6 +59,7 @@ import base64
 import gzip
 import json as _json
 import os
+import time
 import urllib.error
 import urllib.request
 
@@ -283,6 +284,42 @@ class Agent:
         if reason:
             body["reason"] = reason
         return self._post("/task", body)
+
+    def ask(self, question, options=None, timeout_sec=90, default=None,
+            wait=True, poll=True, poll_interval=5.0, poll_timeout=600):
+        """Ask the human a question (popup on their screen). Blocks up to 90s
+        server-side; if still pending, automatically polls GET /ask?id=...
+        until answered / timeout / poll_timeout. v1.6.1: timeout defaults to
+        90s -- ALWAYS pass "default" (your best recommendation); at timeout
+        it auto-applies and you proceed. Returns the final response
+        dict: {ok, answered, answer?, reason?, elapsed_sec}. Set poll=False
+        to get the still-waiting response (with ask_id) back immediately."""
+        body = {"question": question, "wait": bool(wait),
+                "timeout_sec": int(timeout_sec)}
+        if options:
+            body["options"] = [str(o) for o in options[:6]]
+        if default is not None:
+            body["default"] = str(default)
+        r = self._post("/ask", body)
+        if not poll or not isinstance(r, dict) or r.get("answered"):
+            return r
+        ask_id = r.get("ask_id")
+        if not ask_id:                       # 409 busy or error: pass through
+            return r
+        deadline = time.time() + poll_timeout
+        while time.time() < deadline:
+            time.sleep(poll_interval)
+            r = self._get("/ask", params={"id": ask_id})
+            if isinstance(r, dict) and r.get("answered") is not False:
+                return r                     # answered / timeout / cancelled
+            if isinstance(r, dict) and r.get("reason") not in ("waiting", "still-waiting"):
+                return r
+        return r
+
+    def ask_status(self, ask_id=None):
+        """GET /ask — a specific question's status, or the pending one."""
+        params = {"id": ask_id} if ask_id else None
+        return self._get("/ask", params=params)
 
 
 if __name__ == "__main__":

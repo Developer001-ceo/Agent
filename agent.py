@@ -1,6 +1,82 @@
 """
-agent.py -- Remote Test Agent for Windows  (v1.5.3)
+agent.py -- Remote Test Agent for Windows  (v1.6.4)
 ====================================================
+v1.6.4 TUNNEL WATCHDOG + POLISH:
+  Quick tunnels kept dying mid-session (4 deaths in one day of live
+  testing). The agent now supervises cloudflared itself: a background
+  thread checks every 20s; if cloudflared was up once and then died, the
+  agent restarts it (hidden, output to cloudflared-watchdog.log), waits
+  for the NEW trycloudflare URL, writes it to tunnel_url.txt, shows a
+  small toast with the URL so the user can relay it to the AI, and logs
+  every event to tunnel_watchdog.log. Restart rate is capped (max 6 per
+  hour, then a 10-minute backoff) so a broken network cannot loop.
+  GET /tunnel reports {running, url, restarts}. Quick tunnels still
+  rotate URLs on restart -- for a PERMANENT URL see
+  NAMED-TUNNEL-SETUP.md (5 minutes, free Cloudflare account).
+  Also: the timeout flash now pulses 6x130ms (was 5x110) -- clearly
+  visible, still inside the 1.5s grace re-wait; and the free-text entry
+  got brighter text + a lighter field so typed answers read easily.
+
+v1.6.3 iOS-STYLE MOTION FOR THE /ASK POPUP:
+  The ask card now moves like an iPhone modal: rounded corners (DWM round
+  on Win11 + system shadow, window-region fallback elsewhere), a spring
+  entrance (fade + rise with a subtle ease-out-back overshoot), a spring
+  exit (fade + drop), a breathing accent dot, color-tweened hover/press
+  states on every button, a bright pick-flash on the chosen option, a
+  five-pulse highlight of the recommended option when time runs out (the
+  "AI is going with this one" moment), and a smoothly depleting progress
+  bar (50 ms interpolation instead of 1 Hz steps). All motion is ~16 ms
+  after() tweens in pure tkinter -- no new dependencies.
+
+v1.6.2 BLOCKING-RESPONSE RACE FIX (found in live test):
+  When the block window ended at the same moment the popup timed out, the
+  wait timer could beat the resolve by a few ms and the blocking POST /ask
+  returned still-waiting for a question resolved microseconds later. The
+  caller now does a 1.5s grace re-wait, so the blocking call returns the
+  FINAL result (answer / default / hint) whenever it exists at all.
+  Also: stale timeout_sec or-300 fallback -> 90; asks.jsonl now records
+  "proceeded_with" on timeout+default so the audit trail shows what the
+  AI actually continued with.
+
+v1.6.1 ASK UI REDESIGN + 90-SECOND AUTO-PROCEED:
+  The popup is now a proper dark card: "AI PAUSED -- NEEDS YOUR ANSWER"
+  header, bigger question, hover quick-reply buttons (the option matching
+  "default" -- the AI's best recommendation -- is star-marked and amber),
+  focused free-text entry (Enter submits, Esc cancels), and a depleting
+  progress bar with an "auto-continue m:ss" clock (amber at 30s left, red
+  at 10s). A plain-language line under it says exactly what happens if
+  the user does not answer. Gentle re-beep + re-front every 30s so a
+  buried popup is not missed.
+  NEW RULE: timeout_sec DEFAULT 300 -> 90. If the user does not respond
+  within 1:30 the AI PROCEEDS WITH ITS BEST RECOMMENDATION: pass it as
+  "default" and it auto-applies at timeout (the response says so); if no
+  default was passed the timeout response carries a hint telling the AI
+  to decide immediately and never re-ask. Doctrine (Prompt.md v1.6.1):
+  ALWAYS pass "default" -- it is the recommendation, shown in the popup.
+
+v1.6.0 ASK THE HUMAN (MCP-style elicitation, zero extra infra):
+  The AI can now STOP and ASK the user a question mid-task. A blocking
+  HTTP call opens a popup ON THE USER'S SCREEN and the tool result is
+  simply... the human's answer. The AI's tool call naturally suspends
+  until the popup is answered (or times out).
+  POST /ask  {"question":"Which file?","options":["a.docx","b.docx"],
+              "timeout_sec":300,"default":"a.docx","wait":true}
+              -> {ok, answered:true, answer:"a.docx", elapsed_sec}
+              wait=true blocks up to 90s (tunnel-safe); if still pending:
+                 {ok, answered:false, reason:"still-waiting", ask_id} --
+                 then poll GET /ask?id=... every ~5s. wait=false returns
+                 the ask_id at once (long waits / fire-and-forget).
+              -> {ok, answered:false, reason:"timeout", default:"a.docx"}
+              (timeout auto-applies "default" so the task never stalls)
+              -> {ok, answered:false, reason:"cancelled"}  (user closed it)
+  GET  /ask?id=...  -> status of that question (poll while waiting)
+  GET  /ask         -> {pending:{question,options,opened_sec_ago}} or none
+  The dialog: topmost tkinter window + system beep + quick-reply buttons
+  for "options" + free-text entry + countdown + auto-close. The bar
+  shows "Thinking: waiting for your answer..." while pending. One
+  question at a time (409 + the pending question if busy). Every Q&A is
+  appended to asks.jsonl (ts, question, answer, outcome).
+
 v1.5.3 THE TURBO LOOP (one round trip per iteration, local vision):
   The v1.5.2 demo showed where the remaining seconds hide: conservative
   fixed sleeps while waiting for apps to appear, a second round trip to
@@ -171,7 +247,7 @@ pyautogui.PAUSE = 0.05
 TOKEN = "Czj3u9HadjO-PkEMw9X9VR_S02v_ZXKMD9CcFT1WADs"
 HOST = "127.0.0.1"          # localhost only -- never change to 0.0.0.0
 PORT = 8787
-VERSION = "1.5.3"
+VERSION = "1.6.4"
 AGENT_ROOT = os.path.dirname(os.path.abspath(__file__))
 JOBS_DIR = os.path.join(AGENT_ROOT, "jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
@@ -599,6 +675,17 @@ class TaskIn(BaseModel):
     task: Optional[str] = None          # label; required for state=start
     state: str = "start"                # start | thinking | done | fail | clear
     reason: Optional[str] = None        # v1.4.0: why thinking / why it failed
+
+
+class AskIn(BaseModel):
+    question: Optional[str] = None      # REQUIRED: short, human-readable
+    options: Optional[List[str]] = None # quick-reply buttons (max 6)
+    timeout_sec: int = 90               # popup lifetime (10-1800). v1.6.1:
+                                        # 1:30 default -- no answer -> the
+                                        # AI proceeds with "default"
+    default: Optional[str] = None       # best recommendation; auto-applies
+                                        # at timeout so the task never stalls
+    wait: bool = True                   # false = return ask_id at once
 
 
 # ------------------------------------------------------------- adb helper ----
@@ -1201,6 +1288,24 @@ def health(request: Request):
                               if any(h in m.lower() for h in _VLM_HINTS)]},
         "agent_version": VERSION,
     }
+
+
+@app.get("/tunnel")
+def tunnel_status(request: Request):
+    """v1.6.4: cloudflared watchdog status. 'running' reflects a live
+    cloudflared process; 'url' is the last URL the watchdog captured (or
+    the one in tunnel_url.txt). Quick-tunnel URLs rotate on every restart
+    -- if this url differs from the one you are calling through, the one
+    you are using is stale."""
+    guard(request)
+    with _TUNNEL_LOCK:
+        restarts = _TUNNEL["restarts"]
+        url = _TUNNEL["url"] or _tunnel_url_from_file()
+        seen_up = _TUNNEL["seen_up"]
+    return {"ok": True, "running": _cloudflared_running(), "url": url,
+            "restarts": restarts, "watchdog_armed": seen_up,
+            "note": "quick tunnels rotate URLs; for a permanent URL see "
+                    "NAMED-TUNNEL-SETUP.md"}
 
 
 @app.get("/screenshot")
@@ -2302,6 +2407,639 @@ def task_ep(inp: TaskIn, request: Request):
     return {"ok": True, "task": snap}
 
 
+# =========================================================================
+# v1.6.0 -- /ask : the AI stops and asks the human (MCP-style elicitation)
+# =========================================================================
+# One question at a time. The popup runs in its own thread (it owns its Tk
+# instance exclusively -- the only safe way to use tkinter off the main
+# thread). The HTTP handler blocks on a threading.Event, capped at 90s so
+# the Cloudflare tunnel can never 524; longer waits degrade gracefully into
+# polling GET /ask?id=... . Every resolved question is appended to
+# asks.jsonl next to agent.py.
+
+ASK_BLOCK_CAP_SEC = 90          # longest a POST /ask will block (tunnel-safe)
+ASK_LOG_FILE = os.path.join(AGENT_ROOT, "asks.jsonl")
+
+_ASK_LOCK = threading.Lock()
+_ASK = None            # live record while a question is up (see _ask_new)
+_ASK_DONE = {}         # ask_id -> resolved record (bounded history)
+_ASK_HIST_MAX = 20
+
+
+def _ask_new(question, options, timeout_sec, default):
+    rec = {
+        "id": secrets.token_hex(6),
+        "question": question,
+        "options": options or [],
+        "timeout_sec": timeout_sec,
+        "default": default,
+        "opened_ts": time.time(),
+        "event": threading.Event(),
+        "resolved": False,
+        "outcome": None,       # answered | timeout | cancelled | error
+        "answer": None,
+        "error": None,
+    }
+    return rec
+
+
+def _ask_resolve(rec, outcome, answer=None, error=None):
+    """Mark a question resolved exactly once, log it, tidy the bar."""
+    with _ASK_LOCK:
+        if rec["resolved"]:
+            return
+        rec["resolved"] = True
+        rec["outcome"] = outcome
+        rec["answer"] = answer
+        rec["error"] = error
+        global _ASK
+        if _ASK is rec:
+            _ASK = None
+        _ASK_DONE[rec["id"]] = rec
+        while len(_ASK_DONE) > _ASK_HIST_MAX:
+            _ASK_DONE.pop(next(iter(_ASK_DONE)))
+        try:
+            with open(ASK_LOG_FILE, "a", encoding="utf-8") as f:
+                entry = {"ts": time.time(),
+                         "question": rec["question"],
+                         "options": rec["options"],
+                         "outcome": outcome,
+                         "answer": answer,
+                         "elapsed_sec": round(time.time() - rec["opened_ts"], 1)}
+                # v1.6.2: on timeout+default record what the AI actually
+                # proceeded with, so the audit trail tells the full story.
+                if outcome == "timeout" and rec["default"] is not None:
+                    entry["proceeded_with"] = rec["default"]
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+    rec["event"].set()
+    # bar: brief, outcome-aware note so the user sees how it continued
+    try:
+        with _TASK_LOCK:
+            if _TASK["state"] in _ACTIVE_STATES:
+                _TASK["state"] = "thinking"
+                _TASK["reason"] = {
+                    "answered": "answer received -- resuming",
+                    "timeout": "no answer -- continuing with the plan",
+                    "cancelled": "question skipped -- resuming",
+                }.get(outcome, "question closed -- resuming")
+    except Exception:
+        pass
+
+
+def _ask_dialog(rec):
+    """The popup (v1.6.3 iOS-motion redesign). Runs alone in its own
+    thread; every Tk call happens here. A dark rounded card: spring
+    entrance (fade + rise, ease-out-back overshoot), spring exit (fade +
+    drop), breathing accent dot, color-tweened hover/press buttons, a
+    bright pick-flash on the chosen option, a five-pulse highlight of the
+    recommended option at timeout, and a smoothly depleting progress bar
+    with an "auto-continue m:ss" clock (amber at 30s left, red at 10s).
+    The line under it states exactly what happens if the user does not
+    answer. On any close path the record is resolved
+    (answered/timeout/cancelled)."""
+    try:
+        import tkinter as tk
+        from tkinter import ttk
+    except Exception as e:                       # no GUI session / no tkinter
+        _ask_resolve(rec, "error", error="cannot open dialog: %s" % e)
+        return
+
+    # ---- palette ------------------------------------------------------
+    BG = "#0b1220"; PANEL = "#1e293b"; ACCENT = "#38bdf8"
+    AMBER = "#f59e0b"; RED = "#ef4444"; TEXT = "#f1f5f9"; MUTED = "#94a3b8"
+    BTN = "#155e75"; BTN_H = "#0e7490"           # quick-reply idle / hover
+    REC_C = "#b45309"; REC_H = "#d97706"         # recommended idle / hover
+    GREEN = "#34d399"; FLASH = "#e0f2fe"         # answered / pick-flash tints
+
+    def _rgb(c):
+        c = c.lstrip("#")
+        return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+
+    def _hex_lerp(c1, c2, t):
+        a, b = _rgb(c1), _rgb(c2)
+        return "#%02x%02x%02x" % tuple(
+            max(0, min(255, round(a[i] + (b[i] - a[i]) * t)))
+            for i in range(3))
+
+    def _col_dist(c1, c2):
+        a, b = _rgb(c1), _rgb(c2)
+        return sum(abs(a[i] - b[i]) for i in range(3))
+
+    def beep():
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        except Exception:
+            pass
+
+    beep()
+
+    root = tk.Tk()
+    root.title("AI question -- win-agent")
+    root.attributes("-topmost", True)
+    root.configure(bg=BG)
+    root.resizable(False, False)
+
+    ALPHA_OK = True                              # fades need -alpha support
+    try:
+        root.attributes("-alpha", 1.0)
+    except Exception:
+        ALPHA_OK = False
+
+    def _round_corners(win, w, h):
+        """iOS-style rounded card. DWMWCP_ROUND on Win11 (adds the system
+        shadow too); CreateRoundRectRgn window region as the fallback."""
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+            pref = ctypes.c_int(2)               # DWMWCP_ROUND
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, 33, ctypes.byref(pref), 4) == 0:
+                return
+        except Exception:
+            pass
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+            rgn = ctypes.windll.gdi32.CreateRoundRectRgn(
+                0, 0, w + 1, h + 1, 16, 16)
+            ctypes.windll.user32.SetWindowRgn(hwnd, rgn, True)
+        except Exception:
+            pass
+
+    result = {"value": None}
+    total = max(1, int(rec["timeout_sec"]))
+    remain = {"sec": total}
+
+    # ---- animated close: status line swap + fade/drop exit -------------
+    def close(outcome, answer=None):
+        if result["value"] is not None:
+            return
+        result["value"] = (outcome, answer)
+        try:
+            if outcome == "answered":
+                auto_lbl.config(text="\u2713 Got it \u2014 continuing\u2026",
+                                fg=GREEN)
+            elif outcome == "cancelled":
+                auto_lbl.config(text="Skipped \u2014 the AI will proceed",
+                                fg=MUTED)
+        except Exception:
+            pass
+        t0 = time.time()
+        y0 = root.winfo_y()
+
+        def _exit_step():
+            t = (time.time() - t0) / 0.26
+            if t >= 1.0:
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+                return
+            try:
+                root.geometry("+%d+%d" % (root.winfo_x(),
+                                          y0 + round(26 * t * t)))
+            except Exception:
+                pass
+            if ALPHA_OK:
+                try:
+                    root.attributes("-alpha", max(0.0, 1.0 - t))
+                except Exception:
+                    pass
+            root.after(16, _exit_step)
+        _exit_step()
+
+    def submit_free(_e=None):
+        txt = entry.get().strip()
+        if txt and result["value"] is None:
+            try:
+                entry.config(bg="#052e16", fg=GREEN)
+            except Exception:
+                pass
+            close("answered", txt)
+
+    # ---- hover/press color-tween engine (one loop drives all buttons) --
+    _BTN_FX = []          # {btn, idle, hover, press, cur, target}
+
+    def _fx_target(it, color, snap=False):
+        it["target"] = color
+        if snap:
+            it["cur"] = color
+            try:
+                it["btn"].config(bg=color)
+            except Exception:
+                pass
+
+    def _fx_step():
+        if result["value"] is not None:
+            return
+        for it in _BTN_FX:
+            try:
+                if it["cur"] != it["target"]:
+                    nc = _hex_lerp(it["cur"], it["target"], 0.45)
+                    if _col_dist(nc, it["target"]) <= 12:
+                        nc = it["target"]
+                    it["cur"] = nc
+                    it["btn"].config(bg=nc)
+            except Exception:
+                pass
+        root.after(20, _fx_step)
+
+    def mk_btn(parent, text, cmd, idle, hover, font, padx=12, pady=7):
+        """Flat button wired into the color-tween engine (hover/press)."""
+        press = _hex_lerp(idle, "#000000", 0.38)
+        it = {"idle": idle, "hover": hover, "press": press,
+              "cur": idle, "target": idle, "btn": None}
+        b = tk.Button(parent, text=text, command=cmd, bg=idle, fg="white",
+                      activebackground=hover, activeforeground="white",
+                      relief="flat", font=font, padx=padx, pady=pady,
+                      cursor="hand2")
+        it["btn"] = b
+        b.bind("<Enter>", lambda e, i=it: _fx_target(i, i["hover"]))
+        b.bind("<Leave>", lambda e, i=it: _fx_target(i, i["idle"]))
+        b.bind("<ButtonPress-1>", lambda e, i=it: _fx_target(
+            i, i["press"], snap=True))
+        _BTN_FX.append(it)
+        return b, it
+
+    # ---- header (breathing accent dot) ---------------------------------
+    head = tk.Frame(root, bg=BG)
+    head.pack(fill="x", padx=22, pady=(16, 6))
+    dot = tk.Label(head, text="\u25cf", bg=BG, fg=ACCENT,
+                   font=("Segoe UI", 10, "bold"))
+    dot.pack(side="left")
+    tk.Label(head, text="  AI PAUSED -- NEEDS YOUR ANSWER", bg=BG, fg=ACCENT,
+             font=("Segoe UI", 9, "bold")).pack(side="left")
+
+    def _breathe():
+        if result["value"] is not None:
+            return
+        import math
+        k = 0.5 - 0.5 * math.cos(2 * math.pi * ((time.time() % 2.6) / 2.6))
+        try:
+            dot.config(fg=_hex_lerp("#0e5a73", ACCENT, k))
+        except Exception:
+            pass
+        root.after(70, _breathe)
+
+    # ---- question ------------------------------------------------------
+    tk.Label(root, text=rec["question"], bg=BG, fg=TEXT, wraplength=432,
+             justify="left", font=("Segoe UI", 12)).pack(
+                 anchor="w", padx=22, pady=(0, 12))
+
+    # ---- quick replies (recommended star-marked; click = flash + close) -
+    rec_fx = [None]                               # fx item of the default
+    if rec["options"]:
+        grid = tk.Frame(root, bg=BG)
+        grid.pack(fill="x", padx=22)
+        ncols = 2 if len(rec["options"]) <= 4 else 3
+        for i, opt in enumerate(rec["options"]):
+            is_rec = rec["default"] is not None and opt == rec["default"]
+            idle_c = REC_C if is_rec else BTN
+            hover_c = REC_H if is_rec else BTN_H
+            it = {"idle": idle_c, "hover": hover_c,
+                  "press": _hex_lerp(idle_c, "#000000", 0.38),
+                  "cur": idle_c, "target": idle_c, "btn": None}
+
+            def _pick(o=opt, i2=it):
+                if result["value"] is not None:
+                    return
+                _fx_target(i2, FLASH, snap=True)   # bright pick flash
+                try:
+                    i2["btn"].config(fg="#0b1220")
+                except Exception:
+                    pass
+                root.after(150, lambda: close("answered", o))
+
+            b = tk.Button(grid,
+                          text=("\u2605  " + opt) if is_rec else opt,
+                          command=_pick, bg=idle_c, fg="white",
+                          activebackground=hover_c, activeforeground="white",
+                          relief="flat",
+                          font=("Segoe UI", 10, "bold" if is_rec else "normal"),
+                          padx=12, pady=7, cursor="hand2")
+            it["btn"] = b
+            b.bind("<Enter>", lambda e, i2=it: _fx_target(i2, i2["hover"]))
+            b.bind("<Leave>", lambda e, i2=it: _fx_target(i2, i2["idle"]))
+            b.bind("<ButtonPress-1>", lambda e, i2=it: _fx_target(
+                i2, i2["press"], snap=True))
+            _BTN_FX.append(it)
+            if is_rec:
+                rec_fx[0] = it
+            b.grid(row=i // ncols, column=i % ncols, sticky="ew",
+                   padx=3, pady=3)
+        for c in range(ncols):
+            grid.columnconfigure(c, weight=1)
+        tk.Label(root, text="...or type your own answer:", bg=BG, fg=MUTED,
+                 font=("Segoe UI", 8)).pack(anchor="w", padx=22, pady=(8, 0))
+
+    # ---- free text -----------------------------------------------------
+    entry = tk.Entry(root, font=("Segoe UI", 11), width=54, bg="#101b2e",
+                     fg="#f8fafc", insertbackground="#f8fafc",
+                     relief="solid", bd=1,
+                     highlightthickness=1, highlightbackground=PANEL,
+                     highlightcolor=ACCENT)
+    entry.pack(fill="x", padx=22, pady=(5, 10))
+    entry.bind("<Return>", submit_free)
+    entry.focus_set()
+    root.bind("<Escape>", lambda e: close("cancelled"))
+
+    # ---- footer buttons --------------------------------------------------
+    foot = tk.Frame(root, bg=BG)
+    foot.pack(fill="x", padx=22)
+    mk_btn(foot, "Submit answer", submit_free, "#0e7490", "#155e75",
+           ("Segoe UI", 10, "bold"), padx=18, pady=6)[0].pack(side="right")
+    mk_btn(foot, "Cancel", lambda: close("cancelled"), PANEL, "#334155",
+           ("Segoe UI", 9), padx=14, pady=6)[0].pack(side="right",
+                                                     padx=(0, 8))
+
+    # ---- countdown strip: depleting bar + what happens on timeout -------
+    style = ttk.Style()
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+    # NOTE: ttk style names MUST carry the orientation ("Horizontal.") --
+    # without it the layout lookup fails (Layout Horizontal.X not found).
+    PB = "ask.Horizontal.TProgressbar"
+    style.configure(PB, troughcolor=PANEL, background=ACCENT,
+                    bordercolor=BG, lightcolor=ACCENT, darkcolor=ACCENT,
+                    thickness=6)
+    strip = tk.Frame(root, bg=BG)
+    strip.pack(fill="x", padx=22, pady=(16, 2))
+    bar = ttk.Progressbar(strip, style=PB, maximum=total, value=total,
+                          mode="determinate")
+    bar.pack(side="left", fill="x", expand=True)
+    clock = tk.Label(strip, text="", bg=BG, fg=MUTED,
+                     font=("Segoe UI", 9, "bold"), width=18, anchor="e")
+    clock.pack(side="left", padx=(10, 0))
+
+    auto_txt = ("No answer? The AI will go with \u201c%s\u201d"
+                % rec["default"][:40]) if rec["default"] else \
+               "No answer? The AI will use its best judgment"
+    auto_lbl = tk.Label(root, text=auto_txt, bg=BG, fg=MUTED,
+                        font=("Segoe UI", 8), wraplength=432, justify="left")
+    auto_lbl.pack(anchor="w", padx=22, pady=(0, 16))
+
+    # ---- smooth depletion (50 ms) + 1 Hz heartbeat + timeout flash ------
+    t_start = {"t": time.time()}
+
+    def _bar_step():
+        if result["value"] is not None:
+            return
+        try:
+            bar["value"] = max(0, total - (time.time() - t_start["t"]))
+        except Exception:
+            pass
+        root.after(50, _bar_step)
+
+    def timeout_flash():
+        """Time is up: swap the status line, pulse the recommended option
+        (the 'AI is going with this one' moment), then close."""
+        if result["value"] is not None:
+            return
+        try:
+            if rec["default"]:
+                auto_lbl.config(
+                    text="Time\u2019s up \u2014 the AI is going with "
+                         "\u201c%s\u201d" % rec["default"][:40], fg=AMBER)
+            else:
+                auto_lbl.config(
+                    text="Time\u2019s up \u2014 the AI will use its best "
+                         "judgment", fg=AMBER)
+        except Exception:
+            pass
+        state = {"n": 0}
+
+        def pulse():
+            if result["value"] is not None:
+                return
+            if rec_fx[0] is not None and state["n"] < 6:
+                bright = (state["n"] % 2 == 0)
+                _fx_target(rec_fx[0], "#fbbf24" if bright else REC_C,
+                           snap=True)
+                state["n"] += 1
+                root.after(130, pulse)
+            else:
+                close("timeout")
+        pulse()
+
+    def tick():
+        if result["value"] is not None:
+            return
+        remain["sec"] -= 1
+        if remain["sec"] <= 0:
+            timeout_flash()
+            return
+        m, s = divmod(remain["sec"], 60)
+        clock.config(text="auto-continue %d:%02d" % (m, s))
+        if remain["sec"] <= 10:
+            clock.config(fg=RED)
+            style.configure(PB, background=RED, lightcolor=RED, darkcolor=RED)
+        elif remain["sec"] <= 30:
+            clock.config(fg=AMBER)
+            style.configure(PB, background=AMBER, lightcolor=AMBER,
+                            darkcolor=AMBER)
+        if remain["sec"] % 30 == 0:            # gentle reminder; re-front it
+            beep()
+            try:
+                root.attributes("-topmost", True)
+                root.focus_force()
+            except Exception:
+                pass
+        root.after(1000, tick)
+
+    root.protocol("WM_DELETE_WINDOW", lambda: close("cancelled"))
+    root.update_idletasks()
+    w, h = root.winfo_reqwidth(), root.winfo_reqheight()
+    cx = (root.winfo_screenwidth() - w) // 2
+    ty = (root.winfo_screenheight() - h) // 2 - 80
+    _round_corners(root, w, h)
+
+    # ---- iOS-style entrance: fade + rise with a gentle overshoot --------
+    y0 = ty + 40
+    root.geometry("+%d+%d" % (cx, y0))
+    if ALPHA_OK:
+        try:
+            root.attributes("-alpha", 0.0)
+        except Exception:
+            pass
+
+    def _entrance():
+        c1 = 1.9; c3 = c1 + 1.0
+        t0 = time.time()
+
+        def step():
+            t = min(1.0, (time.time() - t0) / 0.42)
+            p = t - 1.0
+            e = 1.0 + c3 * p * p * p + c1 * p * p   # easeOutBack (>1 ok)
+            try:
+                root.geometry("+%d+%d" % (cx, round(y0 + (ty - y0) * e)))
+            except Exception:
+                pass
+            if ALPHA_OK:
+                try:
+                    root.attributes("-alpha", 1.0 - (1.0 - t) ** 3)
+                except Exception:
+                    pass
+            if t < 1.0:
+                root.after(16, step)
+        step()
+    _entrance()
+
+    root.after(20, _fx_step)
+    root.after(50, _bar_step)
+    root.after(70, _breathe)
+    root.after(1000, tick)
+    try:
+        root.focus_force()
+    except Exception:
+        pass
+
+    try:
+        root.mainloop()
+    except Exception as e:
+        _ask_resolve(rec, "error", error="dialog crashed: %s" % e)
+        return
+
+    if result["value"] is None:                 # mainloop exited abnormally
+        _ask_resolve(rec, "error", error="dialog closed unexpectedly")
+        return
+    outcome, answer = result["value"]
+    _ask_resolve(rec, outcome, answer=answer)
+
+
+def _ask_snapshot(rec, include_answer=True):
+    snap = {"ask_id": rec["id"],
+            "question": rec["question"],
+            "options": rec["options"],
+            "opened_sec_ago": round(time.time() - rec["opened_ts"], 1),
+            "resolved": rec["resolved"],
+            "outcome": rec["outcome"]}
+    if include_answer:
+        snap["answer"] = rec["answer"]
+        if rec["default"] is not None:
+            snap["default"] = rec["default"]
+    return snap
+
+
+@app.post("/ask")
+def ask_ep(inp: AskIn, request: Request):
+    """Ask the human a question -- the popup opens on the user's screen and
+    this call blocks (<=90s) until answered. The AI's tool call suspends:
+    the response IS the human's answer. If still pending at the block cap,
+    poll GET /ask?id=<ask_id>. "wait":false returns the id at once for
+    long timeouts. One question at a time (409 while one is pending)."""
+    guard(request)
+    global _ASK
+    question = (inp.question or "").strip()
+    if not question:
+        return {"ok": False, "error": "question is required"}
+    question = question[:500]
+
+    options = []
+    for o in (inp.options or []):
+        o = str(o).strip()
+        if o and o not in options:
+            options.append(o[:120])
+    options = options[:6]
+
+    timeout_sec = min(max(int(inp.timeout_sec or 90), 10), 1800)  # v1.6.2:
+    # stale 300 fallback removed -- the never-stall default is 90s
+    default = (inp.default or None)
+    if default is not None:
+        default = str(default).strip()[:300] or None
+
+    with _ASK_LOCK:
+        if _ASK is not None:
+            raise HTTPException(status_code=409, detail={
+                "ok": False,
+                "error": "a question is already pending on the user's screen",
+                "pending": _ask_snapshot(_ASK, include_answer=False)})
+        rec = _ask_new(question, options, timeout_sec, default)
+        _ASK = rec
+
+    t = threading.Thread(target=_ask_dialog, args=(rec,), daemon=True)
+    t.start()
+
+    # bar: tell the user a question is up
+    try:
+        with _TASK_LOCK:
+            if _TASK["state"] in _ACTIVE_STATES or _TASK["state"] == "idle":
+                _TASK["state"] = "thinking"
+                _TASK["reason"] = "waiting for your answer (dialog on screen)"
+    except Exception:
+        pass
+
+    if not inp.wait:
+        return {"ok": True, "answered": False, "reason": "waiting",
+                "ask_id": rec["id"],
+                "hint": "poll GET /ask?id=%s every few seconds" % rec["id"]}
+
+    rec["event"].wait(min(timeout_sec, ASK_BLOCK_CAP_SEC))
+
+    # v1.6.2 race fix: when the block window ends at the same moment the
+    # popup times out, the wait timer can fire a few ms BEFORE the resolve
+    # lands -- the caller would get still-waiting for a question that is
+    # resolved microseconds later. A short grace re-wait closes that window
+    # so the blocking call returns the FINAL result (answer / default / hint)
+    # whenever it is available at all.
+    if not rec["resolved"]:
+        rec["event"].wait(1.5)
+
+    if rec["resolved"]:
+        return _ask_response(rec)
+    return {"ok": True, "answered": False, "reason": "still-waiting",
+            "ask_id": rec["id"],
+            "hint": "poll GET /ask?id=%s every ~5s until answered" % rec["id"]}
+
+
+def _ask_response(rec):
+    """Uniform response for a resolved question."""
+    out = {"ok": True, "answered": rec["outcome"] == "answered",
+           "reason": rec["outcome"],
+           "elapsed_sec": round(time.time() - rec["opened_ts"], 1)}
+    if rec["outcome"] == "answered":
+        out["answer"] = rec["answer"]
+    elif rec["outcome"] == "timeout" and rec["default"] is not None:
+        out["answer"] = rec["default"]      # never stall: best recommendation
+        out["note"] = "timeout -- proceeding with your recommended default"
+    elif rec["outcome"] == "timeout":
+        out["hint"] = ("no default was given -- proceed NOW with your best "
+                       "judgment; do not re-ask the same question")
+    elif rec["outcome"] == "cancelled":
+        out["hint"] = ("user skipped the question -- proceed with a safe "
+                       "choice or ask differently")
+    elif rec["outcome"] == "error":
+        out["error"] = rec["error"]
+    return out
+
+
+@app.get("/ask")
+def ask_status(request: Request, id: Optional[str] = None):
+    """Poll a question's status (GET /ask?id=...) or see what is pending
+    (GET /ask with no id)."""
+    guard(request)
+    if id:
+        with _ASK_LOCK:
+            rec = _ASK if (_ASK is not None and _ASK["id"] == id) else _ASK_DONE.get(id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail={
+                "ok": False, "error": "unknown ask_id (history keeps the last 20)"})
+        if rec["resolved"]:
+            return _ask_response(rec)
+        return {"ok": True, "answered": False, "reason": "waiting",
+                **_ask_snapshot(rec, include_answer=False)}
+    with _ASK_LOCK:
+        if _ASK is None:
+            return {"ok": True, "pending": None}
+        return {"ok": True, "pending": _ask_snapshot(_ASK, include_answer=False)}
+
+
 def _spawn_indicator() -> None:
     """Start the thin indicator bar (Windows only). It lives as a separate
     detached process: it survives agent restarts, reconnects using the fresh
@@ -2325,6 +3063,169 @@ def _spawn_indicator() -> None:
         print(" Indicator bar     : spawn failed (%s)" % e)
 
 
+# ----------------------------------------------------------------------
+# v1.6.4: cloudflared tunnel watchdog. Quick tunnels die without warning
+# (no uptime guarantee); when one dies mid-session the agent becomes
+# unreachable until the user manually restarts run.bat. This thread keeps
+# a tunnel up on its own: it only acts if cloudflared was seen running at
+# least once (so local-only runs are never hijacked), restarts it hidden,
+# extracts the new URL from its output and surfaces it to the user.
+# ----------------------------------------------------------------------
+_TUNNEL = {"seen_up": False, "url": None, "restarts": 0,
+           "restart_times": [], "proc": None}
+_TUNNEL_LOCK = threading.Lock()
+_TUNNEL_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+
+
+def _tunnel_log(msg: str) -> None:
+    try:
+        with open(os.path.join(AGENT_ROOT, "tunnel_watchdog.log"), "a",
+                  encoding="utf-8", errors="replace") as f:
+            f.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except OSError:
+        pass
+
+
+def _cloudflared_running() -> bool:
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq cloudflared.exe"],
+            capture_output=True, text=True, timeout=10).stdout or ""
+        return "cloudflared" in out.lower()
+    except Exception:
+        return False                    # tasklist missing (non-Windows) -> no
+
+
+def _tunnel_url_from_file() -> Optional[str]:
+    try:
+        with open(os.path.join(AGENT_ROOT, "tunnel_url.txt"),
+                  encoding="ascii", errors="replace") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def _tunnel_toast(url: str) -> None:
+    """Small self-closing popup with the NEW tunnel URL -- the user must
+    relay it to the AI (quick tunnels rotate URLs on every restart)."""
+    def run():
+        try:
+            import tkinter as tk               # local: agent may run headless
+            r = tk.Tk()
+            r.withdraw()
+            box = tk.Toplevel(r)
+            box.title("win-agent: tunnel restarted")
+            box.configure(bg="#0f172a")
+            box.attributes("-topmost", True)
+            box.resizable(False, False)
+            tk.Label(box, text="The Cloudflare tunnel died and was restarted.",
+                     bg="#0f172a", fg="#e2e8f0",
+                     font=("Segoe UI", 10, "bold")).pack(padx=18, pady=(14, 4))
+            tk.Label(box, text="New URL (send this to your AI):", bg="#0f172a",
+                     fg="#94a3b8", font=("Segoe UI", 9)).pack(padx=18)
+            tk.Label(box, text=url, bg="#0f172a", fg="#38bdf8", wraplength=420,
+                     font=("Consolas", 9)).pack(padx=18, pady=(2, 10))
+            tk.Label(box, text="also saved to tunnel_url.txt  --  closes in 20s",
+                     bg="#0f172a", fg="#64748b",
+                     font=("Segoe UI", 8)).pack(padx=18, pady=(0, 12))
+            box.geometry("+%d+%d" % (max(0, r.winfo_screenwidth() - 520), 60))
+            try:
+                import winsound
+                winsound.MessageBeep()
+            except Exception:
+                pass
+            box.after(20000, lambda: (box.destroy(), r.destroy()))
+            r.mainloop()
+        except Exception:
+            pass                       # toast is best-effort, never fatal
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _tunnel_restart() -> bool:
+    """Start a fresh hidden cloudflared, wait for its URL, persist it and
+    toast the user. Returns True if a URL was captured."""
+    exe = shutil.which("cloudflared")
+    if not exe:
+        _tunnel_log("restart aborted: cloudflared not on PATH")
+        return False
+    log_path = os.path.join(AGENT_ROOT, "cloudflared-watchdog.log")
+    try:
+        logf = open(log_path, "ab")
+    except OSError:
+        return False
+    try:
+        _TUNNEL["proc"] = subprocess.Popen(
+            [exe, "tunnel", "--url", "http://127.0.0.1:%d" % PORT,
+             "--no-autoupdate"],
+            stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception as e:
+        _tunnel_log("restart failed: %s" % e)
+        logf.close()
+        return False
+    with _TUNNEL_LOCK:
+        _TUNNEL["restarts"] += 1
+        _TUNNEL["restart_times"].append(time.time())
+        _TUNNEL["restart_times"] = _TUNNEL["restart_times"][-20:]
+    _tunnel_log("cloudflared restarted (pid %s), waiting for URL..."
+                % _TUNNEL["proc"].pid)
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        time.sleep(1.5)
+        if _TUNNEL["proc"].poll() is not None:
+            _tunnel_log("restarted cloudflared exited early (rc=%s)"
+                        % _TUNNEL["proc"].returncode)
+            return False
+        try:
+            with open(log_path, "rb") as f:
+                f.seek(max(0, f.seek(0, 2) - 16384))     # last 16 KB
+                txt = f.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        m = _TUNNEL_URL_RE.search(txt)
+        if m:
+            url = m.group(0)
+            with _TUNNEL_LOCK:
+                _TUNNEL["url"] = url
+            try:
+                with open(os.path.join(AGENT_ROOT, "tunnel_url.txt"), "w",
+                          encoding="ascii") as f:
+                    f.write(url + "\n")
+            except OSError:
+                pass
+            _tunnel_log("tunnel up: %s" % url)
+            _tunnel_toast(url)
+            return True
+    _tunnel_log("no URL found in cloudflared output after 30s")
+    return False
+
+
+def _tunnel_watch_loop() -> None:
+    if os.name != "nt":
+        return
+    while True:
+        time.sleep(20)
+        if _cloudflared_running():
+            if not _TUNNEL["seen_up"]:
+                _TUNNEL["seen_up"] = True
+                _tunnel_log("cloudflared detected running (watchdog armed)")
+            continue
+        if not _TUNNEL["seen_up"]:
+            continue            # user never started a tunnel this session
+        # it was up, now it is dead -> restart, rate-capped
+        with _TUNNEL_LOCK:
+            hour_ago = time.time() - 3600
+            recent = [t for t in _TUNNEL["restart_times"] if t > hour_ago]
+            _TUNNEL["restart_times"] = recent
+            capped = len(recent) >= 6
+        if capped:
+            _tunnel_log("rate cap hit (6 restarts/hour) -- backing off 10 min")
+            time.sleep(600)               # OUTSIDE the lock (never block /tunnel)
+            continue
+        _tunnel_log("cloudflared DIED -- restarting it")
+        _tunnel_restart()
+
+
 if __name__ == "__main__":
     import uvicorn
     print("=" * 64)
@@ -2332,6 +3233,9 @@ if __name__ == "__main__":
     print(" Token starts with   :  %s..." % TOKEN[:8])
     print(" Jobs log dir        :  %s" % JOBS_DIR)
     _spawn_indicator()
+    threading.Thread(target=_tunnel_watch_loop, daemon=True,
+                     name="tunnel-watchdog").start()
+    print(" Tunnel watchdog     : armed (auto-restarts cloudflared if it dies)")
     print(" KEEP THIS WINDOW OPEN. KEEP THE CLOUDFLARED WINDOW OPEN.")
     print("=" * 64)
     uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
