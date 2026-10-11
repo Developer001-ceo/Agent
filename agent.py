@@ -1,6 +1,23 @@
 """
-agent.py -- Remote Test Agent for Windows  (v1.6.4)
+agent.py -- Remote Test Agent for Windows  (v1.6.5)
 ====================================================
+v1.6.5 CRASH FIX -- ONE TK INTERPRETER FOR THE WHOLE PROCESS:
+  Live-testing v1.6.4 surfaced a hard crash: right after an /ask popup
+  closed, the agent process DIED with "Tcl_AsyncDelete: async handler
+  deleted by the wrong thread" (cloudflared then logged endless "origin
+  refused" -- the tunnel was fine, the agent behind it was gone). Root
+  cause: every popup created its OWN Tk() interpreter inside its own
+  thread, so interpreter churn across threads raced Tcl's per-thread
+  bookkeeping. The fix is architectural: ONE persistent, withdrawn Tk
+  root owned by a single dedicated UI thread, started lazily and never
+  destroyed until the process exits. /ask popups and the tunnel-watchdog
+  toast are now Toplevels on that root, built from a job queue pumped
+  inside the UI thread, so every Tk call happens on the interpreter's
+  own thread and the wrong-thread-deletion bug class is gone entirely.
+  Dialog behavior (animations, flash, resolve, audit) is unchanged, and
+  a wedged UI thread can never leave a question unresolved (the
+  wrapper thread carries a safety-net resolve).
+
 v1.6.4 TUNNEL WATCHDOG + POLISH:
   Quick tunnels kept dying mid-session (4 deaths in one day of live
   testing). The agent now supervises cloudflared itself: a background
@@ -219,6 +236,7 @@ import ctypes
 import io
 import json
 import os
+import queue
 import re
 import secrets
 import shutil
@@ -247,7 +265,7 @@ pyautogui.PAUSE = 0.05
 TOKEN = "Czj3u9HadjO-PkEMw9X9VR_S02v_ZXKMD9CcFT1WADs"
 HOST = "127.0.0.1"          # localhost only -- never change to 0.0.0.0
 PORT = 8787
-VERSION = "1.6.4"
+VERSION = "1.6.5"
 AGENT_ROOT = os.path.dirname(os.path.abspath(__file__))
 JOBS_DIR = os.path.join(AGENT_ROOT, "jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
@@ -2488,11 +2506,98 @@ def _ask_resolve(rec, outcome, answer=None, error=None):
         pass
 
 
+# ---- persistent UI manager (v1.6.5) ----------------------------------
+# ONE Tk interpreter for the whole process life, owned by ONE thread.
+# v1.6.4 and earlier created a fresh Tk() (and a second one for the
+# tunnel toast) inside whatever thread asked -- interpreter churn
+# across threads races Tcl's per-thread bookkeeping and killed the
+# agent with "Tcl_AsyncDelete: async handler deleted by the wrong
+# thread". Everything Tk now rides this single root.
+_UI_LOCK = threading.Lock()
+_UI_JOBS = queue.Queue()                # callables to run IN the UI thread
+_UI = {"root": None, "err": None, "ready": threading.Event()}
+
+
+def _ui_pump():
+    """Runs inside the UI thread: drains queued jobs, reschedules itself."""
+    root = _UI["root"]
+    while True:
+        try:
+            job = _UI_JOBS.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            job()
+        except Exception as e:               # a bad job must not kill the pump
+            _UI["err"] = str(e)
+    root.after(40, _ui_pump)
+
+
+def _ui_root():
+    """The ONE Tk root (lazily started inside its own daemon thread).
+    Returns None when Tk is unavailable -- callers degrade gracefully."""
+    if _UI["root"] is not None:
+        return _UI["root"]
+    if _UI["err"]:
+        return None
+    with _UI_LOCK:
+        if _UI["root"] is not None:
+            return _UI["root"]
+        if _UI["err"]:
+            return None
+        try:
+            import tkinter as _tk           # probe; Tk() itself must happen
+        except Exception as e:               # in the UI thread, not here
+            _UI["err"] = "tkinter unavailable: %s" % e
+            return None
+
+        def _run():
+            try:
+                root = _tk.Tk()
+                root.withdraw()              # the root itself is never shown
+                _UI["root"] = root
+                _UI["ready"].set()
+                root.after(40, _ui_pump)
+                root.mainloop()              # until process exit (daemon)
+            except Exception as e:
+                _UI["err"] = str(e)
+                _UI["ready"].set()
+        threading.Thread(target=_run, daemon=True, name="ui-root").start()
+        _UI["ready"].wait(6)
+        return _UI["root"]
+
+
 def _ask_dialog(rec):
-    """The popup (v1.6.3 iOS-motion redesign). Runs alone in its own
-    thread; every Tk call happens here. A dark rounded card: spring
-    entrance (fade + rise, ease-out-back overshoot), spring exit (fade +
-    drop), breathing accent dot, color-tweened hover/press buttons, a
+    """Popup wrapper (v1.6.5): builds the dialog ON the shared UI thread
+    and waits until it finishes. All Tk calls happen inside that thread;
+    this wrapper only queues the job and sleeps -- so a wedged UI can
+    never leave the question unresolved."""
+    root = _ui_root()
+    if root is None:
+        _ask_resolve(rec, "error",
+                     error="cannot open dialog: %s" % (_UI["err"] or "no UI"))
+        return
+    done = threading.Event()
+
+    def build():
+        try:
+            _ask_dialog_ui(root, rec, done)
+        except Exception as e:
+            _ask_resolve(rec, "error", error="dialog crashed: %s" % e)
+            done.set()
+    _UI_JOBS.put(build)
+
+    # safety net: dialog died without resolving (UI thread wedged?)
+    if not done.wait(max(30, int(rec["timeout_sec"]) + 30)):
+        _ask_resolve(rec, "error",
+                     error="dialog did not finish (UI thread unresponsive)")
+
+
+def _ask_dialog_ui(root_parent, rec, done):
+    """The popup (v1.6.3 iOS-motion redesign). Runs ON the shared UI
+    thread as a Toplevel; every Tk call happens here. A dark rounded card:
+    spring entrance (fade + rise, ease-out-back overshoot), spring exit (fade
+    + drop), breathing accent dot, color-tweened hover/press buttons, a
     bright pick-flash on the chosen option, a five-pulse highlight of the
     recommended option at timeout, and a smoothly depleting progress bar
     with an "auto-continue m:ss" clock (amber at 30s left, red at 10s).
@@ -2504,6 +2609,7 @@ def _ask_dialog(rec):
         from tkinter import ttk
     except Exception as e:                       # no GUI session / no tkinter
         _ask_resolve(rec, "error", error="cannot open dialog: %s" % e)
+        done.set()
         return
 
     # ---- palette ------------------------------------------------------
@@ -2536,7 +2642,7 @@ def _ask_dialog(rec):
 
     beep()
 
-    root = tk.Tk()
+    root = tk.Toplevel(root_parent)          # v1.6.5: rides the shared root
     root.title("AI question -- win-agent")
     root.attributes("-topmost", True)
     root.configure(bg=BG)
@@ -2576,6 +2682,13 @@ def _ask_dialog(rec):
     remain = {"sec": total}
 
     # ---- animated close: status line swap + fade/drop exit -------------
+    def _finish():
+        """Resolve + wake the wrapper; called from the UI thread right
+        after the toplevel is destroyed."""
+        outcome, answer = result["value"] or ("error", None)
+        _ask_resolve(rec, outcome, answer=answer)
+        done.set()
+
     def close(outcome, answer=None):
         if result["value"] is not None:
             return
@@ -2599,6 +2712,7 @@ def _ask_dialog(rec):
                     root.destroy()
                 except Exception:
                     pass
+                _finish()
                 return
             try:
                 root.geometry("+%d+%d" % (root.winfo_x(),
@@ -2899,18 +3013,9 @@ def _ask_dialog(rec):
         root.focus_force()
     except Exception:
         pass
-
-    try:
-        root.mainloop()
-    except Exception as e:
-        _ask_resolve(rec, "error", error="dialog crashed: %s" % e)
-        return
-
-    if result["value"] is None:                 # mainloop exited abnormally
-        _ask_resolve(rec, "error", error="dialog closed unexpectedly")
-        return
-    outcome, answer = result["value"]
-    _ask_resolve(rec, outcome, answer=answer)
+    # v1.6.5: no mainloop here -- the shared root's mainloop (UI thread)
+    # drives all the after() animations above; _finish() resolves the
+    # record from the exit animation once the toplevel is destroyed.
 
 
 def _ask_snapshot(rec, include_answer=True):
@@ -3107,37 +3212,42 @@ def _tunnel_url_from_file() -> Optional[str]:
 
 def _tunnel_toast(url: str) -> None:
     """Small self-closing popup with the NEW tunnel URL -- the user must
-    relay it to the AI (quick tunnels rotate URLs on every restart)."""
+    relay it to the AI (quick tunnels rotate URLs on every restart).
+    v1.6.5: rides the shared UI thread (no second Tk interpreter)."""
     def run():
-        try:
-            import tkinter as tk               # local: agent may run headless
-            r = tk.Tk()
-            r.withdraw()
-            box = tk.Toplevel(r)
-            box.title("win-agent: tunnel restarted")
-            box.configure(bg="#0f172a")
-            box.attributes("-topmost", True)
-            box.resizable(False, False)
-            tk.Label(box, text="The Cloudflare tunnel died and was restarted.",
-                     bg="#0f172a", fg="#e2e8f0",
-                     font=("Segoe UI", 10, "bold")).pack(padx=18, pady=(14, 4))
-            tk.Label(box, text="New URL (send this to your AI):", bg="#0f172a",
-                     fg="#94a3b8", font=("Segoe UI", 9)).pack(padx=18)
-            tk.Label(box, text=url, bg="#0f172a", fg="#38bdf8", wraplength=420,
-                     font=("Consolas", 9)).pack(padx=18, pady=(2, 10))
-            tk.Label(box, text="also saved to tunnel_url.txt  --  closes in 20s",
-                     bg="#0f172a", fg="#64748b",
-                     font=("Segoe UI", 8)).pack(padx=18, pady=(0, 12))
-            box.geometry("+%d+%d" % (max(0, r.winfo_screenwidth() - 520), 60))
+        root = _ui_root()
+        if root is None:
+            return                       # toast is best-effort, never fatal
+
+        def build():
             try:
-                import winsound
-                winsound.MessageBeep()
+                import tkinter as tk
+                box = tk.Toplevel(root)
+                box.title("win-agent: tunnel restarted")
+                box.configure(bg="#0f172a")
+                box.attributes("-topmost", True)
+                box.resizable(False, False)
+                tk.Label(box, text="The Cloudflare tunnel died and was restarted.",
+                         bg="#0f172a", fg="#e2e8f0",
+                         font=("Segoe UI", 10, "bold")).pack(padx=18, pady=(14, 4))
+                tk.Label(box, text="New URL (send this to your AI):", bg="#0f172a",
+                         fg="#94a3b8", font=("Segoe UI", 9)).pack(padx=18)
+                tk.Label(box, text=url, bg="#0f172a", fg="#38bdf8", wraplength=420,
+                         font=("Consolas", 9)).pack(padx=18, pady=(2, 10))
+                tk.Label(box, text="also saved to tunnel_url.txt  --  closes in 20s",
+                         bg="#0f172a", fg="#64748b",
+                         font=("Segoe UI", 8)).pack(padx=18, pady=(0, 12))
+                box.geometry("+%d+%d" % (max(0, root.winfo_screenwidth() - 520),
+                                          60))
+                try:
+                    import winsound
+                    winsound.MessageBeep()
+                except Exception:
+                    pass
+                box.after(20000, box.destroy)   # root must NEVER die here
             except Exception:
                 pass
-            box.after(20000, lambda: (box.destroy(), r.destroy()))
-            r.mainloop()
-        except Exception:
-            pass                       # toast is best-effort, never fatal
+        _UI_JOBS.put(build)
     threading.Thread(target=run, daemon=True).start()
 
 

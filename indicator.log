@@ -14,3 +14,14 @@
 [2026-10-09 19:14:20] indicator bar v1.5.1 starting (pid 25340, agent http://127.0.0.1:8787)
 [2026-10-09 19:14:20] bar up: 2560x45 px at top of screen, polling http://127.0.0.1:8787/indicator (control server on 127.0.0.1:8799)
 [2026-10-09 19:14:20] capture-cloak ON (WDA_EXCLUDEFROMCAPTURE) -- bar stays on screen but never appears in screenshots
+[2026-10-09 21:00:48] indicator bar v1.5.1 starting (pid 36484, agent http://127.0.0.1:8787)
+[2026-10-09 21:00:48] bar up: 2560x45 px at top of screen, polling http://127.0.0.1:8787/indicator (control server on 127.0.0.1:8799)
+[2026-10-09 21:00:49] capture-cloak ON (WDA_EXCLUDEFROMCAPTURE) -- bar stays on screen but never appears in screenshots
+[2026-10-11 01:48:21] indicator bar v1.5.1 starting (pid 13376, agent http://127.0.0.1:8787)
+[2026-10-11 01:48:22] bar up: 2560x45 px at top of screen, polling http://127.0.0.1:8787/indicator (control server on 127.0.0.1:8799)
+[2026-10-11 01:48:22] capture-cloak ON (WDA_EXCLUDEFROMCAPTURE) -- bar stays on screen but never appears in screenshots
+[2026-10-11 02:06:54] indicator bar v1.5.1 starting (pid 10760, agent http://127.0.0.1:8787)
+[2026-10-11 02:06:54] bar up: 2560x45 px at top of screen, polling http://127.0.0.1:8787/indicator (control server on 127.0.0.1:8799)
+[2026-10-11 02:06:55] capture-cloak ON (WDA_EXCLUDEFROMCAPTURE) -- bar stays on screen but never appears in screenshots
+[2026-10-11 02:17:39] exiting: closed by user
+[2026-10-11 02:17:40] exiting: closed by user
